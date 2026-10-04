@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3a2a8c"/><stop offset=".55" stop-color="#1b1640"/><stop offset="1" stop-color="#0f0c29"/></linearGradient>
+    <linearGradient id="gx" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff5e9c"/><stop offset="1" stop-color="#ff9a5e"/></linearGradient>
+    <linearGradient id="go" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3fd8ff"/><stop offset="1" stop-color="#7b6cff"/></linearGradient>
+    <radialGradient id="glow" cx=".25" cy=".2" r=".7"><stop offset="0" stop-color="#ff5e9c" stop-opacity=".35"/><stop offset="1" stop-color="#ff5e9c" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="url(#glow)"/>
+  
+  <g transform="translate(256 256) scale(1) translate(-256 -256)">
+    <path d="M118 150L228 260M228 150L118 260" stroke="url(#gx)" stroke-width="44" stroke-linecap="round" fill="none"/>
+    <circle cx="340" cy="335" r="66" stroke="url(#go)" stroke-width="42" fill="none"/>
+  </g>
+</svg>

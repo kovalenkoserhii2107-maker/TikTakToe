@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Крестики-нолики онлайн</title>
+  <meta name="description" content="Сетевые крестики-нолики: создай игру или подключись к сопернику.">
+  <meta name="theme-color" content="#0f0c29">
+  <meta name="color-scheme" content="dark">
+  <meta name="format-detection" content="telephone=no">
+  <!-- режим «ярлыка» (PWA) -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Крестики">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="bg" aria-hidden="true">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+    <div class="bg-grid"></div>
+  </div>
+  <canvas id="confetti" aria-hidden="true"></canvas>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-x" viewBox="0 0 40 40"><path d="M10 10L30 30M30 10L10 30"/></svg>
+      <svg class="brand-o" viewBox="0 0 40 40"><circle cx="20" cy="20" r="11"/></svg>
+    </div>
+    <div class="conn" id="conn"><span class="dot"></span><span id="connText">Подключение…</span></div>
+  </header>
+
+  <main>
+    <!-- ЛОББИ -->
+    <section class="screen" id="screen-lobby">
+      <div class="card install-card hidden" id="installCard">
+        <img src="icons/icon-192.png" alt="" class="install-icon">
+        <div class="install-text">
+          <div class="install-title">Установи игру на телефон</div>
+          <div class="install-sub" id="installSub">Ярлык на главном экране, игра на весь экран</div>
+        </div>
+        <button class="btn primary small hidden" id="installBtn">Установить</button>
+        <button class="install-close" id="installClose" aria-label="Скрыть">✕</button>
+      </div>
+      <h1 class="title">
+        <span class="t-x">Крестики</span><span class="t-dash">-</span><span class="t-o">нолики</span>
+      </h1>
+      <p class="subtitle">Сетевая игра. Ты всегда <b class="c-x">✕</b>, <span class="nowrap">соперник — <b class="c-o">◯</b></span></p>
+
+      <div class="card resume-card hidden" id="resumeCard">
+        <div class="resume-head">
+          <div class="resume-marks">
+            <svg class="rm-x" viewBox="0 0 40 40"><path d="M11 11L29 29M29 11L11 29"/></svg>
+            <svg class="rm-o" viewBox="0 0 40 40"><circle cx="20" cy="20" r="10"/></svg>
+          </div>
+          <div class="resume-info">
+            <div class="resume-title">Незаконченная игра</div>
+            <div class="resume-sub" id="resumeSub"></div>
+            <div class="opp-state" id="resumeState"></div>
+          </div>
+        </div>
+        <div class="resume-actions">
+          <button class="btn primary" id="resumeBtn">Продолжить</button>
+          <button class="btn ghost" id="resumeEndBtn">Завершить</button>
+        </div>
+      </div>
+
+      <div class="card name-card">
+        <label for="nameInput">Твоё имя</label>
+        <div class="name-row">
+          <input id="nameInput" maxlength="20" placeholder="Например, Сергей" autocomplete="nickname">
+          <button class="btn primary" id="createBtn">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Создать игру
+          </button>
+        </div>
+      </div>
+
+      <div class="card lobby-card">
+        <div class="lobby-head">
+          <h2>Ожидают соперника</h2>
+          <span class="online" id="onlineCount">онлайн: 0</span>
+        </div>
+        <ul class="lobby-list" id="lobbyList"></ul>
+        <div class="empty" id="lobbyEmpty">
+          <div class="empty-icon"><span></span><span></span><span></span></div>
+          Пока никто не ждёт. Создай игру — и друзья смогут подключиться!
+        </div>
+      </div>
+    </section>
+
+    <!-- ОЖИДАНИЕ -->
+    <section class="screen hidden" id="screen-wait">
+      <div class="card wait-card">
+        <div class="radar"><span></span><span></span><span></span>
+          <svg viewBox="0 0 40 40"><path d="M10 10L30 30M30 10L10 30"/></svg>
+        </div>
+        <h2>Ждём соперника…</h2>
+        <p>Твоя игра видна в лобби всем игрокам.<br>Как только кто-то подключится — начнём.</p>
+        <button class="btn ghost" id="cancelWaitBtn">Отменить</button>
+      </div>
+    </section>
+
+    <!-- ИГРА -->
+    <section class="screen hidden" id="screen-game">
+      <div class="scoreboard">
+        <div class="player me" id="pMe">
+          <div class="p-mark x"><svg viewBox="0 0 40 40"><path d="M11 11L29 29M29 11L11 29"/></svg></div>
+          <div class="p-name" id="meName">Ты</div>
+          <div class="opp-state" id="meState"></div>
+          <div class="p-score" id="meScore">0</div>
+        </div>
+        <div class="draws">
+          <div class="vs">VS</div>
+          <div class="d-label">ничьи</div>
+          <div class="d-score" id="drawScore">0</div>
+        </div>
+        <div class="player opp" id="pOpp">
+          <div class="p-mark o"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="10"/></svg></div>
+          <div class="p-name" id="oppName">Соперник</div>
+          <div class="opp-state" id="oppState"></div>
+          <div class="p-score" id="oppScore">0</div>
+        </div>
+      </div>
+
+      <div class="turn" id="turnInfo">…</div>
+
+      <div class="board-wrap">
+        <div class="board" id="board"></div>
+        <svg class="win-line" id="winLine" viewBox="0 0 300 300"><line id="winLineEl" x1="0" y1="0" x2="0" y2="0"/></svg>
+      </div>
+
+      <div class="game-foot">
+        <span class="round" id="roundInfo">Раунд 1</span>
+        <div class="foot-actions">
+          <button class="btn ghost small" id="leaveBtn">В лобби</button>
+          <button class="btn ghost small danger" id="endBtn">Завершить</button>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <div class="overlay hidden" id="overlay">
+    <div class="result">
+      <div class="r-icon" id="rIcon"></div>
+      <div class="r-title" id="rTitle"></div>
+      <div class="r-sub" id="rSub"></div>
+      <div class="r-next" id="rNext"></div>
+      <button class="btn primary hidden" id="toLobbyBtn">В лобби</button>
+    </div>
+  </div>
+
+  <div class="overlay hidden" id="confirm">
+    <div class="result confirm">
+      <div class="c-text" id="cText"></div>
+      <div class="c-actions">
+        <button class="btn ghost" id="cCancel">Отмена</button>
+        <button class="btn primary" id="cOk">Да</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+
+  <script src="vendor/mqtt.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
