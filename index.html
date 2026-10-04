@@ -54,6 +54,24 @@
       </h1>
       <p class="subtitle">Сетевая игра. Ты всегда <b class="c-x">✕</b>, <span class="nowrap">соперник — <b class="c-o">◯</b></span></p>
 
+      <div class="card resume-card hidden" id="resumeCard">
+        <div class="resume-head">
+          <div class="resume-marks">
+            <svg class="rm-x" viewBox="0 0 40 40"><path d="M11 11L29 29M29 11L11 29"/></svg>
+            <svg class="rm-o" viewBox="0 0 40 40"><circle cx="20" cy="20" r="10"/></svg>
+          </div>
+          <div class="resume-info">
+            <div class="resume-title">Незаконченная игра</div>
+            <div class="resume-sub" id="resumeSub"></div>
+            <div class="opp-state" id="resumeState"></div>
+          </div>
+        </div>
+        <div class="resume-actions">
+          <button class="btn primary" id="resumeBtn">Продолжить</button>
+          <button class="btn ghost" id="resumeEndBtn">Завершить</button>
+        </div>
+      </div>
+
       <div class="card name-card">
         <label for="nameInput">Твоё имя</label>
         <div class="name-row">
@@ -96,6 +114,7 @@
         <div class="player me" id="pMe">
           <div class="p-mark x"><svg viewBox="0 0 40 40"><path d="M11 11L29 29M29 11L11 29"/></svg></div>
           <div class="p-name" id="meName">Ты</div>
+          <div class="opp-state" id="meState"></div>
           <div class="p-score" id="meScore">0</div>
         </div>
         <div class="draws">
@@ -106,6 +125,7 @@
         <div class="player opp" id="pOpp">
           <div class="p-mark o"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="10"/></svg></div>
           <div class="p-name" id="oppName">Соперник</div>
+          <div class="opp-state" id="oppState"></div>
           <div class="p-score" id="oppScore">0</div>
         </div>
       </div>
@@ -119,7 +139,10 @@
 
       <div class="game-foot">
         <span class="round" id="roundInfo">Раунд 1</span>
-        <button class="btn ghost small" id="leaveBtn">Выйти в лобби</button>
+        <div class="foot-actions">
+          <button class="btn ghost small" id="leaveBtn">В лобби</button>
+          <button class="btn ghost small danger" id="endBtn">Завершить</button>
+        </div>
       </div>
 
     </section>
@@ -132,6 +155,16 @@
       <div class="r-sub" id="rSub"></div>
       <div class="r-next" id="rNext"></div>
       <button class="btn primary hidden" id="toLobbyBtn">В лобби</button>
+    </div>
+  </div>
+
+  <div class="overlay hidden" id="confirm">
+    <div class="result confirm">
+      <div class="c-text" id="cText"></div>
+      <div class="c-actions">
+        <button class="btn ghost" id="cCancel">Отмена</button>
+        <button class="btn primary" id="cOk">Да</button>
+      </div>
     </div>
   </div>
 

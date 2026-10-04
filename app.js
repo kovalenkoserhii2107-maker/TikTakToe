@@ -2,9 +2,11 @@
   'use strict';
 
   // ---------- настройки сети ----------
-  // Игра работает без собственного сервера: игроки обмениваются сообщениями
-  // через публичный MQTT-брокер по WebSocket. Брокер можно переопределить
-  // параметром ?broker=wss://host:port/path
+  // Своего сервера нет: каждое устройство хранит полную копию партии
+  // (историю ходов) и само считает по ней доску, счёт и очередь хода.
+  // Сообщения между устройствами идут через публичный MQTT-брокер по WebSocket,
+  // он только пересылает их. Брокер можно переопределить параметром
+  // ?broker=wss://host:port/path
   const PREFIX = 'tiktaktoe-ks/v1';
   const params = new URLSearchParams(location.search);
   const BROKERS = params.get('broker')
@@ -21,23 +23,37 @@
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
   const me = {
-    id: uid(),
+    id: loadId(),
     name: safeStorage('get', 'ttt-name') || '',
     status: 'lobby', // lobby | waiting | playing
   };
-  const players = new Map(); // id -> { name, status, seen }
+  const players = new Map(); // id -> { name, status, game, seen }
   let client = null;
   let brokerIdx = 0;
-  let game = null;
   let pendingJoin = null;
+  // Текущая партия. Хранится на обоих устройствах и переживает закрытие приложения.
+  // moves — строка из номеров клеток (0–8) по порядку за все раунды.
+  let game = null;
+
+  game = loadGame();
 
   // ---------- утилиты ----------
   function safeStorage(op, key, val) {
     try {
       if (op === 'get') return localStorage.getItem(key);
+      if (op === 'remove') return localStorage.removeItem(key);
       localStorage.setItem(key, val);
     } catch (e) { /* приватный режим */ }
     return null;
+  }
+
+  function loadId() {
+    let id = safeStorage('get', 'ttt-id');
+    if (!id || !/^[a-z0-9]{6,24}$/.test(id)) {
+      id = uid();
+      safeStorage('set', 'ttt-id', id);
+    }
+    return id;
   }
 
   function cleanName(s) {
@@ -64,6 +80,143 @@
     return h;
   }
 
+  function ask(html, okLabel) {
+    return new Promise((resolve) => {
+      $('cText').innerHTML = html;
+      $('cOk').textContent = okLabel || 'Да';
+      $('confirm').classList.remove('hidden');
+      const done = (v) => {
+        $('confirm').classList.add('hidden');
+        $('cOk').onclick = $('cCancel').onclick = null;
+        resolve(v);
+      };
+      $('cOk').onclick = () => done(true);
+      $('cCancel').onclick = () => done(false);
+    });
+  }
+
+  function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // ---------- хранение партии ----------
+  function newGame(id, oppId, oppName, firstId) {
+    return { id, oppId, oppName, firstId, moves: '', oppState: 'offline', ui: freshUi() };
+  }
+
+  function freshUi() {
+    return { round: 0, finished: 0, advanced: 0, lineRound: 0, nextTimer: null, overlayTimer: null, score: null, openedAt: Date.now() };
+  }
+
+  function loadGame() {
+    try {
+      const g = JSON.parse(safeStorage('get', 'ttt-game') || 'null');
+      if (!g || typeof g.id !== 'string' || typeof g.oppId !== 'string' || typeof g.firstId !== 'string') return null;
+      const res = newGame(g.id, g.oppId, cleanName(g.oppName) || 'Игрок', g.firstId);
+      res.moves = sanitizeMoves(res, g.moves);
+      return res;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveGame() {
+    if (!game) return;
+    const { id, oppId, oppName, firstId, moves } = game;
+    safeStorage('set', 'ttt-game', JSON.stringify({ id, oppId, oppName, firstId, moves }));
+  }
+
+  function endedList() {
+    try { return JSON.parse(safeStorage('get', 'ttt-ended') || '[]'); } catch (e) { return []; }
+  }
+
+  function dropGame() {
+    if (!game) return;
+    clearTimeout(game.ui.nextTimer);
+    clearTimeout(game.ui.overlayTimer);
+    const ended = endedList().filter((x) => x !== game.id);
+    ended.push(game.id);
+    safeStorage('set', 'ttt-ended', JSON.stringify(ended.slice(-30)));
+    safeStorage('remove', 'ttt-game');
+    game = null;
+  }
+
+  // ---------- правила: состояние считается из истории ходов ----------
+  function otherId(id) { return id === me.id ? game.oppId : me.id; }
+
+  // Право первого хода чередуется каждый раунд
+  function firstOfRound(r) {
+    return r % 2 === 1 ? game.firstId : otherId(game.firstId);
+  }
+
+  function moverOf(r, k) {
+    const first = firstOfRound(r);
+    return (k % 2 === 0 ? first : otherId(first)) === me.id ? 'me' : 'opp';
+  }
+
+  function checkBoard(b) {
+    for (const line of LINES) {
+      const [a, c, d] = line;
+      if (b[a] && b[a] === b[c] && b[a] === b[d]) return { winner: b[a], line };
+    }
+    if (b.every(Boolean)) return { winner: null };
+    return null;
+  }
+
+  function replay(moves, g) {
+    const saved = game;
+    if (g) game = g;
+    const s = { round: 1, board: Array(9).fill(null), score: { me: 0, opp: 0, draw: 0 }, over: false, result: null, valid: 0 };
+    let start = 0;
+    for (let i = 0; i < moves.length; i++) {
+      if (s.over) {
+        s.round++;
+        s.board = Array(9).fill(null);
+        s.over = false;
+        s.result = null;
+        start = i;
+      }
+      const cell = moves.charCodeAt(i) - 48;
+      if (!(cell >= 0 && cell <= 8) || s.board[cell]) break;
+      s.board[cell] = moverOf(s.round, i - start);
+      s.valid = i + 1;
+      const res = checkBoard(s.board);
+      if (res) {
+        s.over = true;
+        s.result = res;
+        if (res.winner) s.score[res.winner]++;
+        else s.score.draw++;
+      }
+    }
+    s.turn = s.over ? null : moverOf(s.round, s.valid - start);
+    game = saved;
+    return s;
+  }
+
+  function sanitizeMoves(g, moves) {
+    moves = typeof moves === 'string' ? moves.replace(/[^0-8]/g, '').slice(0, 5000) : '';
+    return moves.slice(0, replay(moves, g).valid);
+  }
+
+  // Две копии одной партии: берём более полную. Ходить может только тот,
+  // чья очередь, поэтому одна копия всегда продолжение другой.
+  function mergeMoves(a, b) {
+    if (a === b || a.startsWith(b)) return a;
+    if (b.startsWith(a)) return b;
+    if (a.length !== b.length) return a.length > b.length ? a : b;
+    return a < b ? a : b; // одинаковое правило на обоих устройствах
+  }
+
+  // что показывать: после конца раунда и паузы — уже пустое поле следующего
+  function view(s) {
+    if (s.over && game.ui.advanced === s.round) {
+      return { round: s.round + 1, board: Array(9).fill(null), over: false, result: null, score: s.score, turn: moverOf(s.round + 1, 0) };
+    }
+    return s;
+  }
+
   // ---------- сеть ----------
   const topic = {
     player: (id) => `${PREFIX}/players/${id}`,
@@ -75,6 +228,9 @@
     el.classList.toggle('online', state === 'online');
     el.classList.toggle('offline', state === 'offline');
     $('connText').textContent = text;
+    const ms = $('meState');
+    ms.className = 'opp-state ' + (state === 'online' ? 'ingame' : state === 'offline' ? 'offline' : 'lobby');
+    ms.textContent = state === 'online' ? 'в сети' : state === 'offline' ? 'нет связи' : 'подключение…';
   }
 
   function connect() {
@@ -83,7 +239,8 @@
     let everConnected = false;
     let switched = false;
     client = mqtt.connect(url, {
-      clientId: 'ttt_' + me.id,
+      // id игрока постоянный, а id соединения — свой у каждой вкладки
+      clientId: 'ttt_' + me.id + '_' + uid().slice(0, 6),
       keepalive: 30,
       reconnectPeriod: 2500,
       connectTimeout: 8000,
@@ -96,6 +253,7 @@
       setConn('online', 'Онлайн');
       client.subscribe([`${PREFIX}/players/+`, topic.inbox(me.id)], { qos: 1 });
       publishPresence();
+      if (game) sendState();
     });
     client.on('reconnect', () => setConn('connecting', 'Переподключение…'));
     client.on('offline', () => setConn('offline', 'Нет связи'));
@@ -113,14 +271,24 @@
   }
 
   function send(id, msg) {
-    if (!client) return;
+    if (!client || !client.connected) return;
     msg.from = me.id;
     client.publish(topic.inbox(id), JSON.stringify(msg), { qos: 1 });
   }
 
+  function sendState() {
+    if (!game) return;
+    send(game.oppId, { t: 'state', game: game.id, moves: game.moves, first: game.firstId, name: me.name });
+  }
+
   function publishPresence() {
     if (!client || !client.connected) return;
-    const payload = JSON.stringify({ name: me.name || 'Игрок', status: me.status, ts: Date.now() });
+    const payload = JSON.stringify({
+      name: me.name || 'Игрок',
+      status: me.status,
+      game: game ? game.id : null,
+      ts: Date.now(),
+    });
     client.publish(topic.player(me.id), payload, { qos: 1, retain: true });
   }
 
@@ -137,28 +305,24 @@
     const text = buf.toString();
     if (t.startsWith(`${PREFIX}/players/`)) {
       const id = t.slice(`${PREFIX}/players/`.length);
+      if (id === me.id) return;
       if (!text) {
         players.delete(id);
-        if (game && game.oppId === id && !game.left) opponentLeft();
       } else {
         let p;
         try { p = JSON.parse(text); } catch (e) { return; }
         // для сохранённых (retained) сообщений доверяем метке времени отправителя
         const seen = packet.retain ? Number(p.ts) || 0 : Date.now();
-        players.set(id, { name: cleanName(p.name) || 'Игрок', status: p.status, seen });
-        if (game && game.oppId === id && !game.left) {
-          // статус «не играет» считаем выходом только после того, как соперник уже был в игре
-          if (p.status === 'playing') game.oppSeenPlaying = true;
-          else if (game.oppSeenPlaying) opponentLeft();
-        }
+        players.set(id, { name: cleanName(p.name) || 'Игрок', status: p.status, game: p.game || null, seen });
       }
+      refreshOpp();
       renderLobby();
       return;
     }
     if (t === topic.inbox(me.id)) {
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
-      handleDirect(msg);
+      if (msg && typeof msg.from === 'string') handleDirect(msg);
     }
   }
 
@@ -167,22 +331,30 @@
       case 'join': {
         if (me.status === 'waiting' && !game) {
           const first = Math.random() < 0.5 ? me.id : msg.from;
-          send(msg.from, { t: 'accept', name: me.name, first });
-          startGame(msg.from, cleanName(msg.name) || 'Игрок', first);
+          const id = uid();
+          game = newGame(id, msg.from, cleanName(msg.name) || 'Игрок', first);
+          saveGame();
+          send(msg.from, { t: 'accept', game: id, name: me.name, first });
+          toast(`Соперник: ${game.oppName}. Игра началась!`);
+          openGame(true);
         } else {
           send(msg.from, { t: 'busy' });
         }
         break;
       }
       case 'accept': {
-        if (!pendingJoin || pendingJoin.id !== msg.from || game) {
+        if (!pendingJoin || pendingJoin.id !== msg.from || game || typeof msg.game !== 'string') {
           // соперник принял, а мы уже передумали — сообщаем ему
-          send(msg.from, { t: 'leave' });
+          if (typeof msg.game === 'string') send(msg.from, { t: 'end', game: msg.game });
           return;
         }
         clearTimeout(pendingJoin.timer);
         pendingJoin = null;
-        startGame(msg.from, cleanName(msg.name) || 'Игрок', msg.first);
+        const first = msg.first === me.id ? me.id : msg.from;
+        game = newGame(msg.game, msg.from, cleanName(msg.name) || 'Игрок', first);
+        saveGame();
+        toast(`Соперник: ${game.oppName}. Игра началась!`);
+        openGame(true);
         break;
       }
       case 'busy': {
@@ -194,15 +366,77 @@
         }
         break;
       }
-      case 'move': {
-        if (game && msg.from === game.oppId) onOpponentMove(msg.round, msg.cell);
+      case 'state': {
+        if (!game || msg.game !== game.id || msg.from !== game.oppId) {
+          // партия уже завершена у нас — напоминаем сопернику
+          if (endedList().includes(msg.game)) send(msg.from, { t: 'end', game: msg.game });
+          return;
+        }
+        onState(msg);
         break;
       }
-      case 'leave': {
-        if (game && msg.from === game.oppId && !game.left) opponentLeft();
+      case 'end': {
+        if (game && msg.game === game.id && msg.from === game.oppId) opponentEnded();
         break;
       }
     }
+  }
+
+  function onState(msg) {
+    const name = cleanName(msg.name);
+    if (name && name !== game.oppName) {
+      game.oppName = name;
+      saveGame();
+      updateNames();
+    }
+    const theirs = sanitizeMoves(game, msg.moves);
+    const merged = mergeMoves(game.moves, theirs);
+    if (merged !== game.moves) {
+      game.moves = merged;
+      saveGame();
+      if (me.status === 'playing') render(true);
+    }
+    // у соперника копия отстаёт — отправляем ему свою
+    if (merged !== theirs) sendState();
+    renderLobby();
+  }
+
+  // ---------- соперник: в игре / в лобби / не в сети ----------
+  function oppStateNow() {
+    const p = players.get(game.oppId);
+    if (!p || Date.now() - p.seen > PRESENCE_TTL) return 'offline';
+    return p.status === 'playing' && p.game === game.id ? 'ingame' : 'lobby';
+  }
+
+  const OPP_TEXT = { ingame: 'в игре', lobby: 'в лобби', offline: 'не в сети' };
+
+  function refreshOpp() {
+    if (!game) return;
+    const p = players.get(game.oppId);
+    if (p && p.name && p.name !== game.oppName && p.name !== 'Игрок') {
+      game.oppName = p.name;
+      saveGame();
+      updateNames();
+    }
+    const prev = game.oppState;
+    const now = oppStateNow();
+    game.oppState = now;
+    // сразу после открытия список игроков ещё догружается — не шумим уведомлениями
+    const settled = Date.now() - game.ui.openedAt > 4000;
+    if (prev !== now) {
+      if (now === 'ingame') {
+        sendState(); // соперник вернулся — отдаём ему свою копию партии
+        if (me.status === 'playing' && settled) toast(`${game.oppName} снова в игре!`);
+      } else if (prev === 'ingame' && me.status === 'playing' && settled) {
+        toast(now === 'offline'
+          ? `${game.oppName}: нет связи. Игра сохранена — продолжите, когда соперник вернётся`
+          : `${game.oppName} сейчас в лобби. Игра сохранена`);
+      }
+    }
+    const el = $('oppState');
+    el.className = 'opp-state ' + now;
+    el.textContent = OPP_TEXT[now];
+    if (me.status === 'playing') render(false);
   }
 
   // ---------- лобби ----------
@@ -226,15 +460,15 @@
   function renderLobby() {
     const now = Date.now();
     const list = $('lobbyList');
-    let online = 0;
+    let online = 1;
     const waiting = [];
     for (const [id, p] of players) {
       if (now - p.seen > PRESENCE_TTL) continue;
       online++;
-      if (p.status === 'waiting' && id !== me.id) waiting.push([id, p]);
+      if (p.status === 'waiting') waiting.push([id, p]);
     }
     waiting.sort((a, b) => a[1].name.localeCompare(b[1].name));
-    $('onlineCount').textContent = 'онлайн: ' + Math.max(online, client && client.connected ? 1 : 0);
+    $('onlineCount').textContent = 'онлайн: ' + (client && client.connected ? online : 0);
 
     const keep = new Set(waiting.map(([id]) => id));
     for (const li of [...list.children]) {
@@ -264,13 +498,33 @@
       btn.disabled = !!pendingJoin;
       btn.textContent = joining ? 'Подключение…' : 'Играть';
     }
-    const empty = waiting.length === 0;
-    $('lobbyEmpty').classList.toggle('hidden', !empty);
+    $('lobbyEmpty').classList.toggle('hidden', waiting.length !== 0);
+
+    // карточка незаконченной партии
+    const card = $('resumeCard');
+    card.classList.toggle('hidden', !game);
+    if (game) {
+      const s = replay(game.moves);
+      $('resumeSub').innerHTML = `Соперник: <b>${esc(game.oppName)}</b> · счёт ${s.score.me} : ${s.score.opp}` +
+        (s.score.draw ? ` · ничьих ${s.score.draw}` : '');
+      const st = $('resumeState');
+      const os = oppStateNow();
+      st.className = 'opp-state ' + os;
+      st.textContent = os === 'ingame' ? `${game.oppName} в игре и ждёт тебя` : `${game.oppName} ${OPP_TEXT[os]}`;
+    }
   }
 
-  function createGame() {
+  async function confirmDropSaved() {
+    if (!game) return true;
+    const ok = await ask(`У тебя есть незаконченная игра (соперник: <b>${esc(game.oppName)}</b>).<br>Завершить её и начать новую?`, 'Завершить');
+    if (ok) endGameByMe();
+    return ok;
+  }
+
+  async function createGame() {
     if (!requireName()) return;
     if (!client || !client.connected) { toast('Нет подключения к сети, подожди немного', 'err'); return; }
+    if (!(await confirmDropSaved())) return;
     setStatus('waiting');
     showScreen('wait');
   }
@@ -281,10 +535,11 @@
     renderLobby();
   }
 
-  function joinGame(id) {
+  async function joinGame(id) {
     if (pendingJoin) return;
     if (!requireName()) return;
     if (!client || !client.connected) { toast('Нет подключения к сети', 'err'); return; }
+    if (!(await confirmDropSaved())) return;
     publishPresence();
     pendingJoin = {
       id,
@@ -299,48 +554,77 @@
   }
 
   // ---------- игра ----------
-  function startGame(oppId, oppName, firstId) {
-    game = {
-      oppId, oppName, firstId,
-      round: 0,
-      board: Array(9).fill(null),
-      turn: null,
-      over: false,
-      left: false,
-      oppSeenPlaying: players.get(oppId)?.status === 'playing',
-      score: { me: 0, opp: 0, draw: 0 },
-      nextTimer: null,
-    };
-    setStatus('playing');
-    $('meName').textContent = me.name + ' (ты)';
-    $('oppName').textContent = oppName;
-    $('meScore').textContent = '0';
-    $('oppScore').textContent = '0';
-    $('drawScore').textContent = '0';
+  function updateNames() {
+    if (!game) return;
+    $('meName').textContent = (me.name || 'Ты') + ' (ты)';
+    $('oppName').textContent = game.oppName;
+  }
+
+  function openGame(isNew) {
+    if (!game) return;
+    game.ui = freshUi();
+    game.oppState = oppStateNow();
+    me.status = 'playing';
+    publishPresence();
+    sendState();
+    updateNames();
     $('overlay').classList.add('hidden');
     showScreen('game');
-    toast(`Соперник: ${oppName}. Игра началась!`);
-    startRound(1);
+    refreshOpp();
+    render(isNew);
   }
 
-  // Право первого хода чередуется каждый раунд
-  function firstOfRound(r) {
-    const other = game.firstId === me.id ? game.oppId : me.id;
-    return r % 2 === 1 ? game.firstId : other;
-  }
-
-  function startRound(r) {
-    clearTimeout(game.nextTimer);
-    game.round = r;
-    game.board = Array(9).fill(null);
-    game.over = false;
-    game.turn = firstOfRound(r) === me.id ? 'me' : 'opp';
+  function pauseGame() {
+    if (game) {
+      clearTimeout(game.ui.nextTimer);
+      clearTimeout(game.ui.overlayTimer);
+    }
     $('overlay').classList.add('hidden');
-    $('roundInfo').textContent = 'Раунд ' + r;
-    const wl = $('winLine');
-    wl.classList.remove('show', 'x', 'o');
-    buildBoard();
-    updateTurn();
+    setStatus('lobby');
+    showScreen('lobby');
+    renderLobby();
+  }
+
+  function endGameByMe() {
+    if (!game) return;
+    send(game.oppId, { t: 'end', game: game.id });
+    dropGame();
+    publishPresence();
+  }
+
+  async function endGameClick() {
+    if (!game) return;
+    const s = replay(game.moves);
+    const ok = await ask(`Завершить игру? Соперник: <b>${esc(game.oppName)}</b>.<br>Счёт ${s.score.me} : ${s.score.opp} — продолжить её будет нельзя.`, 'Завершить');
+    if (!ok || !game) return;
+    endGameByMe();
+    pauseGame();
+  }
+
+  function opponentEnded() {
+    const s = replay(game.moves);
+    const name = game.oppName;
+    const wasPlaying = me.status === 'playing';
+    dropGame();
+    publishPresence();
+    if (!wasPlaying) {
+      toast(`Соперник ${name} завершил вашу игру`);
+      renderLobby();
+      return;
+    }
+    $('board').classList.remove('my-turn');
+    $('pMe').classList.remove('active');
+    $('pOpp').classList.remove('active');
+    $('turnInfo').textContent = '';
+    $('rIcon').textContent = '👋';
+    const rt = $('rTitle');
+    rt.textContent = 'Игра завершена';
+    rt.className = 'r-title';
+    $('rSub').textContent = `Соперник ${name} завершил игру`;
+    $('rNext').textContent = `Итоговый счёт ${s.score.me} : ${s.score.opp}` +
+      (s.score.draw ? `, ничьих: ${s.score.draw}` : '');
+    $('toLobbyBtn').classList.remove('hidden');
+    $('overlay').classList.remove('hidden');
   }
 
   function buildBoard() {
@@ -356,6 +640,8 @@
       c.addEventListener('click', () => onCellClick(i));
       board.appendChild(c);
     }
+    const wl = $('winLine');
+    wl.classList.remove('show', 'x', 'o');
   }
 
   function drawMark(i, who) {
@@ -368,60 +654,6 @@
       : '<svg class="o drawn" viewBox="0 0 40 40"><circle cx="20" cy="20" r="12"/></svg>';
   }
 
-  function updateTurn() {
-    const t = $('turnInfo');
-    const mine = game.turn === 'me' && !game.over;
-    $('board').classList.toggle('my-turn', mine);
-    $('pMe').classList.toggle('active', game.turn === 'me' && !game.over);
-    $('pOpp').classList.toggle('active', game.turn === 'opp' && !game.over);
-    if (game.over) { t.className = 'turn'; t.textContent = ''; return; }
-    if (mine) {
-      t.className = 'turn mine';
-      t.textContent = 'Твой ход!';
-    } else {
-      t.className = 'turn theirs';
-      t.innerHTML = '';
-      t.append('Ходит ' + game.oppName);
-      const d = document.createElement('span');
-      d.className = 'dots';
-      t.append(d);
-    }
-  }
-
-  function onCellClick(i) {
-    if (!game || game.over || game.left || game.turn !== 'me' || game.board[i]) return;
-    send(game.oppId, { t: 'move', round: game.round, cell: i });
-    place(i, 'me');
-  }
-
-  function onOpponentMove(round, cell) {
-    if (game.left) return;
-    // соперник уже начал следующий раунд, а у нас ещё идёт отсчёт
-    if (round === game.round + 1 && game.over) startRound(round);
-    if (round !== game.round || game.over) return;
-    if (game.turn !== 'opp' || !Number.isInteger(cell) || cell < 0 || cell > 8 || game.board[cell]) return;
-    place(cell, 'opp');
-  }
-
-  function place(i, who) {
-    game.board[i] = who;
-    drawMark(i, who);
-    const res = checkResult();
-    if (res) return finishRound(res);
-    game.turn = who === 'me' ? 'opp' : 'me';
-    updateTurn();
-  }
-
-  function checkResult() {
-    const b = game.board;
-    for (const line of LINES) {
-      const [a, c, d] = line;
-      if (b[a] && b[a] === b[c] && b[a] === b[d]) return { winner: b[a], line };
-    }
-    if (b.every(Boolean)) return { winner: null };
-    return null;
-  }
-
   function bump(id) {
     const el = $(id);
     el.classList.remove('bump');
@@ -429,41 +661,71 @@
     el.classList.add('bump');
   }
 
-  function finishRound(res) {
-    game.over = true;
-    updateTurn();
-    $('board').classList.add('done');
+  // Перерисовка игры по истории ходов. live = изменение произошло только что
+  // (ход, синхронизация), а не при открытии сохранённой партии.
+  function render(live) {
+    if (!game || me.status !== 'playing') return;
+    const ui = game.ui;
+    const s = replay(game.moves);
 
-    if (res.winner) {
-      const cells = $('board').children;
-      for (const i of res.line) cells[i].classList.add('win', res.winner === 'me' ? 'wx' : 'wo');
-      drawWinLine(res.line, res.winner === 'me' ? 'x' : 'o');
+    if (s.over && ui.finished !== s.round) {
+      ui.finished = s.round;
+      if (live) roundFinished(s);
+      else ui.advanced = s.round;
+    }
+    const d = view(s);
+
+    if (d.round !== ui.round) {
+      clearTimeout(ui.nextTimer);
+      clearTimeout(ui.overlayTimer);
+      $('overlay').classList.add('hidden');
+      ui.round = d.round;
+      buildBoard();
+    }
+    const cells = $('board').children;
+    d.board.forEach((who, i) => {
+      if (who && cells[i].classList.contains('empty')) drawMark(i, who);
+    });
+    if (d.over && ui.lineRound !== d.round) {
+      ui.lineRound = d.round;
+      $('board').classList.add('done');
+      if (d.result.winner) {
+        for (const i of d.result.line) cells[i].classList.add('win', d.result.winner === 'me' ? 'wx' : 'wo');
+        drawWinLine(d.result.line, d.result.winner === 'me' ? 'x' : 'o');
+      }
     }
 
+    // счёт
+    const sc = d.score;
+    if (ui.score) {
+      if (sc.me !== ui.score.me) bump('meScore');
+      if (sc.opp !== ui.score.opp) bump('oppScore');
+      if (sc.draw !== ui.score.draw) bump('drawScore');
+    }
+    ui.score = { ...sc };
+    $('meScore').textContent = sc.me;
+    $('oppScore').textContent = sc.opp;
+    $('drawScore').textContent = sc.draw;
+    $('roundInfo').textContent = 'Раунд ' + d.round;
+    updateTurn(d);
+  }
+
+  function roundFinished(s) {
+    const ui = game.ui;
+    const r = s.round;
+    const winner = s.result.winner;
     let icon, title, cls, sub;
-    if (res.winner === 'me') {
-      game.score.me++;
-      $('meScore').textContent = game.score.me;
-      bump('meScore');
-      icon = '🏆'; title = 'Победа!'; cls = 'win';
-      sub = `Победил <b></b>`;
+    if (winner === 'me') {
+      icon = '🏆'; title = 'Победа!'; cls = 'win'; sub = 'Победитель: <b></b>';
       confetti();
-    } else if (res.winner === 'opp') {
-      game.score.opp++;
-      $('oppScore').textContent = game.score.opp;
-      bump('oppScore');
-      icon = '😮'; title = 'Поражение'; cls = 'lose';
-      sub = `Победил <b></b>`;
+    } else if (winner === 'opp') {
+      icon = '😮'; title = 'Поражение'; cls = 'lose'; sub = 'Победитель: <b></b>';
     } else {
-      game.score.draw++;
-      $('drawScore').textContent = game.score.draw;
-      bump('drawScore');
-      icon = '🤝'; title = 'Ничья!'; cls = '';
-      sub = 'Никто не уступил';
+      icon = '🤝'; title = 'Ничья!'; cls = ''; sub = 'Никто не уступил';
     }
-
-    setTimeout(() => {
-      if (!game || game.left || !game.over) return;
+    const delay = winner ? 1300 : 500;
+    ui.overlayTimer = setTimeout(() => {
+      if (!game || game.ui !== ui || ui.round !== r || ui.advanced === r) return;
       $('rIcon').textContent = icon;
       const rt = $('rTitle');
       rt.textContent = title;
@@ -471,16 +733,50 @@
       const rs = $('rSub');
       rs.innerHTML = sub;
       const b = rs.querySelector('b');
-      if (b) b.textContent = res.winner === 'me' ? me.name : game.oppName;
+      if (b) b.textContent = winner === 'me' ? me.name : game.oppName;
       $('toLobbyBtn').classList.add('hidden');
-      const nextFirst = firstOfRound(game.round + 1) === me.id ? 'ты' : game.oppName;
-      $('rNext').textContent = `Счёт ${game.score.me} : ${game.score.opp}. Следующий раунд — первым ходит ${nextFirst}`;
+      const nextFirst = moverOf(r + 1, 0) === 'me' ? 'ты' : game.oppName;
+      $('rNext').textContent = `Счёт ${s.score.me} : ${s.score.opp}. Следующий раунд — первым ходит ${nextFirst}`;
       $('overlay').classList.remove('hidden');
-    }, res.winner ? 1300 : 500);
+    }, delay);
+    ui.nextTimer = setTimeout(() => {
+      if (!game || game.ui !== ui || ui.finished !== r) return;
+      ui.advanced = r;
+      render(false);
+    }, NEXT_ROUND_DELAY + delay);
+  }
 
-    game.nextTimer = setTimeout(() => {
-      if (game && !game.left && game.over) startRound(game.round + 1);
-    }, NEXT_ROUND_DELAY + (res.winner ? 1300 : 500));
+  function updateTurn(d) {
+    const t = $('turnInfo');
+    const mine = d.turn === 'me' && !d.over;
+    $('board').classList.toggle('my-turn', mine);
+    $('pMe').classList.toggle('active', mine);
+    $('pOpp').classList.toggle('active', d.turn === 'opp' && !d.over);
+    if (d.over) { t.className = 'turn'; t.textContent = ''; return; }
+    if (mine) {
+      t.className = 'turn mine';
+      t.textContent = 'Твой ход!';
+      return;
+    }
+    t.className = 'turn theirs';
+    t.innerHTML = '';
+    const os = game.oppState;
+    t.append(os === 'ingame' ? 'Ходит ' + game.oppName
+      : os === 'lobby' ? `${game.oppName} в лобби — ждём возвращения`
+        : `${game.oppName} не в сети — ждём возвращения`);
+    const dots = document.createElement('span');
+    dots.className = 'dots';
+    t.append(dots);
+  }
+
+  function onCellClick(i) {
+    if (!game || me.status !== 'playing') return;
+    const d = view(replay(game.moves));
+    if (d.over || d.turn !== 'me' || d.board[i]) return;
+    game.moves += String(i);
+    saveGame();
+    sendState();
+    render(true);
   }
 
   function drawWinLine(line, cls) {
@@ -498,36 +794,6 @@
     wl.classList.remove('show', 'x', 'o');
     void wl.getBoundingClientRect();
     wl.classList.add('show', cls);
-  }
-
-  function opponentLeft() {
-    if (!game) return;
-    game.left = true;
-    clearTimeout(game.nextTimer);
-    $('board').classList.remove('my-turn');
-    $('pMe').classList.remove('active');
-    $('pOpp').classList.remove('active');
-    $('turnInfo').textContent = '';
-    $('rIcon').textContent = '👋';
-    const rt = $('rTitle');
-    rt.textContent = 'Соперник вышел';
-    rt.className = 'r-title';
-    $('rSub').textContent = `${game.oppName} покинул игру`;
-    $('rNext').textContent = `Итоговый счёт ${game.score.me} : ${game.score.opp}` +
-      (game.score.draw ? `, ничьих: ${game.score.draw}` : '');
-    $('toLobbyBtn').classList.remove('hidden');
-    $('overlay').classList.remove('hidden');
-    setStatus('lobby');
-  }
-
-  function leaveGame() {
-    if (game && !game.left) send(game.oppId, { t: 'leave' });
-    if (game) clearTimeout(game.nextTimer);
-    game = null;
-    $('overlay').classList.add('hidden');
-    setStatus('lobby');
-    showScreen('lobby');
-    renderLobby();
   }
 
   // ---------- конфетти ----------
@@ -661,30 +927,45 @@
   // приложение с ярлыка могло долго лежать в фоне — соединение надо оживить
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !client) return;
-    if (client.connected) publishPresence();
-    else if (!client.reconnecting && !client.disconnecting) client.reconnect();
+    if (client.connected) {
+      publishPresence();
+      if (game) sendState();
+    } else if (!client.reconnecting && !client.disconnecting) client.reconnect();
     renderLobby();
   });
+
 
   // ---------- запуск ----------
   $('nameInput').value = me.name;
   $('nameInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') createGame(); });
   $('nameInput').addEventListener('change', () => {
     const n = cleanName($('nameInput').value);
-    if (n) { me.name = n; safeStorage('set', 'ttt-name', n); publishPresence(); }
+    if (n) {
+      me.name = n;
+      safeStorage('set', 'ttt-name', n);
+      publishPresence();
+      if (game) sendState();
+    }
   });
   $('createBtn').addEventListener('click', createGame);
   $('cancelWaitBtn').addEventListener('click', cancelWait);
-  $('leaveBtn').addEventListener('click', leaveGame);
-  $('toLobbyBtn').addEventListener('click', leaveGame);
-
-  setInterval(() => { publishPresence(); renderLobby(); }, PRESENCE_EVERY);
-  addEventListener('pagehide', () => {
-    if (game && !game.left) send(game.oppId, { t: 'leave' });
-    clearPresence();
+  $('leaveBtn').addEventListener('click', pauseGame);
+  $('toLobbyBtn').addEventListener('click', pauseGame);
+  $('endBtn').addEventListener('click', endGameClick);
+  $('resumeBtn').addEventListener('click', () => openGame(false));
+  $('resumeEndBtn').addEventListener('click', async () => {
+    if (!game) return;
+    const ok = await ask(`Завершить игру? Соперник: <b>${esc(game.oppName)}</b>.<br>Продолжить её будет нельзя.`, 'Завершить');
+    if (ok && game) { endGameByMe(); renderLobby(); }
   });
 
+  setInterval(() => { publishPresence(); refreshOpp(); renderLobby(); }, PRESENCE_EVERY);
+  addEventListener('pagehide', clearPresence);
+
   setupInstall();
+  setConn('connecting', 'Подключение…');
+  // незаконченная партия — сразу возвращаемся в неё
+  if (game) openGame(false);
   renderLobby();
   if (typeof mqtt === 'undefined') {
     setConn('offline', 'Ошибка загрузки');

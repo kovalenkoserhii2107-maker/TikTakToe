@@ -230,6 +230,39 @@ main { max-width: 760px; margin: 0 auto; padding: 0 calc(16px + var(--sar)) calc
 .r-next { color: var(--muted); margin-top: 14px; font-size: 14px; }
 .result .btn { margin-top: 18px; }
 
+/* ---------- незаконченная игра ---------- */
+.resume-card { border-color: rgba(255,94,156,.45); box-shadow: 0 20px 50px rgba(0,0,0,.3), 0 0 30px rgba(255,94,156,.18); animation: itemIn .5s cubic-bezier(.2,.9,.3,1.3) both; }
+.resume-head { display: flex; align-items: center; gap: 14px; }
+.resume-marks { display: flex; flex: none; }
+.resume-marks svg { width: 34px; height: 34px; fill: none; stroke-width: 6; stroke-linecap: round; }
+.rm-x { stroke: var(--x); animation: wiggle 3s ease-in-out infinite; }
+.rm-o { stroke: var(--o); margin-left: -6px; animation: wiggle 3s ease-in-out infinite reverse; }
+.resume-info { flex: 1; min-width: 0; }
+.resume-title { font-weight: 900; font-size: 18px; }
+.resume-sub { color: var(--muted); font-size: 14px; line-height: 1.35; overflow-wrap: anywhere; }
+.resume-sub b { color: var(--text); }
+.resume-actions { display: flex; gap: 10px; margin-top: 14px; }
+.resume-actions .btn.primary { flex: 1; }
+
+.opp-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); font-weight: 700; margin-top: 2px; }
+.opp-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #7a749e; flex: none; }
+.opp-state.ingame { color: var(--ok); }
+.opp-state.ingame::before { background: var(--ok); animation: pulse-ok 2s infinite; }
+.opp-state.lobby::before { background: #f5b942; }
+.opp-state.offline::before { background: var(--bad); }
+.player .opp-state { font-size: 11px; margin: 0; }
+
+.foot-actions { display: flex; gap: 8px; }
+.btn.danger { color: #ff9aa5; }
+.btn.danger:hover { background: rgba(255,94,108,.18); }
+
+.confirm { max-width: 360px; }
+.c-text { font-size: 17px; font-weight: 700; line-height: 1.45; }
+.c-text b { color: var(--x); }
+.c-actions { display: flex; gap: 10px; justify-content: center; margin-top: 20px; }
+.c-actions .btn { margin-top: 0; flex: 1; }
+#confirm { z-index: 45; }
+
 /* ---------- установка ярлыка ---------- */
 .install-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin: 4px 0 14px; animation: itemIn .5s .3s cubic-bezier(.2,.9,.3,1.3) both; }
 .install-icon { width: 44px; height: 44px; border-radius: 12px; flex: none; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
