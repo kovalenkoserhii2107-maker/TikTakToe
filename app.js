@@ -567,6 +567,105 @@
     })(start);
   }
 
+  // ---------- установка ярлыка (PWA) ----------
+  const ua = navigator.userAgent;
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isAndroid = /Android/i.test(ua);
+  const isInApp = /FBAN|FBAV|Instagram|Line\/|Telegram|VKClient|OKApp/i.test(ua);
+  const DISMISS_KEY = 'ttt-install-dismissed';
+  const DISMISS_FOR = 3 * 24 * 3600 * 1000;
+  let installEvent = null;
+
+  function isStandalone() {
+    return matchMedia('(display-mode: standalone)').matches ||
+      matchMedia('(display-mode: fullscreen)').matches ||
+      navigator.standalone === true;
+  }
+
+  function installDismissed() {
+    return Date.now() - Number(safeStorage('get', DISMISS_KEY) || 0) < DISMISS_FOR;
+  }
+
+  const SHARE_ICON = '<svg class="share-ico" viewBox="0 0 24 24"><path d="M12 3v12M7.5 7.5L12 3l4.5 4.5"/>' +
+    '<path d="M8 10H6a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-2"/></svg>';
+
+  function showInstall(mode) {
+    if (isStandalone() || installDismissed()) return;
+    const sub = $('installSub');
+    const btn = $('installBtn');
+    if (mode === 'prompt') {
+      sub.textContent = 'Ярлык на главном экране, игра на весь экран';
+      btn.classList.remove('hidden');
+    } else if (mode === 'ios') {
+      sub.innerHTML = isInApp
+        ? 'Открой эту страницу в <b>Safari</b>, чтобы добавить ярлык'
+        : `Нажми ${SHARE_ICON} <b>«Поделиться»</b>, затем <b>«На экран „Домой“»</b>`;
+      btn.classList.add('hidden');
+    } else {
+      sub.innerHTML = 'Открой меню браузера <b>⋮</b> и выбери <b>«Добавить на главный экран»</b>';
+      btn.classList.add('hidden');
+    }
+    $('installCard').classList.remove('hidden');
+  }
+
+  function hideInstall() {
+    $('installCard').classList.add('hidden');
+  }
+
+  function setupInstall() {
+    document.documentElement.classList.toggle('standalone', isStandalone());
+    if (isStandalone()) return;
+
+    // Android / Chrome / Edge / Samsung: браузер сам умеет ставить ярлык
+    addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      installEvent = e;
+      showInstall('prompt');
+    });
+    addEventListener('appinstalled', () => {
+      installEvent = null;
+      hideInstall();
+      toast('Игра установлена! Запускай с ярлыка 🎉');
+    });
+    $('installBtn').addEventListener('click', async () => {
+      if (!installEvent) return;
+      const ev = installEvent;
+      installEvent = null;
+      ev.prompt();
+      try {
+        const { outcome } = await ev.userChoice;
+        if (outcome === 'accepted') hideInstall();
+      } catch (e) { /* ничего */ }
+    });
+    $('installClose').addEventListener('click', () => {
+      safeStorage('set', DISMISS_KEY, String(Date.now()));
+      hideInstall();
+    });
+
+    // iPhone / iPad: автоматической установки нет — показываем инструкцию
+    if (isIOS) showInstall('ios');
+    // Android-браузеры без автоматической установки (например, Firefox)
+    else if (isAndroid) setTimeout(() => { if (!installEvent) showInstall('manual'); }, 4000);
+  }
+
+  // если ярлык запустили, пока открыта вкладка, — убираем баннер
+  matchMedia('(display-mode: standalone)').addEventListener?.('change', (e) => {
+    document.documentElement.classList.toggle('standalone', e.matches);
+    if (e.matches) hideInstall();
+  });
+
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  }
+
+  // приложение с ярлыка могло долго лежать в фоне — соединение надо оживить
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !client) return;
+    if (client.connected) publishPresence();
+    else if (!client.reconnecting && !client.disconnecting) client.reconnect();
+    renderLobby();
+  });
+
   // ---------- запуск ----------
   $('nameInput').value = me.name;
   $('nameInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') createGame(); });
@@ -585,6 +684,7 @@
     clearPresence();
   });
 
+  setupInstall();
   renderLobby();
   if (typeof mqtt === 'undefined') {
     setConn('offline', 'Ошибка загрузки');

@@ -12,12 +12,28 @@
   --ok: #3ee89b;
   --bad: #ff5e6c;
   --radius: 22px;
+  /* безопасные зоны (вырез камеры, «чёлка», нижняя полоса жестов) */
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  /* поле не должно вылезать за экран по высоте: высота окна минус шапка, счёт и подписи */
+  --chrome: 380px;
+  --board-max: max(240px, calc(100vh - var(--chrome) - var(--sat) - var(--sab)));
+}
+@supports (height: 100dvh) {
+  :root { --board-max: max(240px, calc(100dvh - var(--chrome) - var(--sat) - var(--sab))); }
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; }
+html { background: var(--bg); -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+html, body { min-height: 100%; overscroll-behavior: none; }
 body {
   margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
   font-family: "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
   color: var(--text);
   background: radial-gradient(1200px 800px at 20% 0%, #2a1f6b 0%, transparent 60%),
@@ -26,6 +42,8 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 button, input { font: inherit; color: inherit; }
+button { -webkit-user-select: none; user-select: none; touch-action: manipulation; }
+.topbar, .scoreboard, .board, .turn, .game-foot, .overlay, .lobby-head, .install-card { -webkit-user-select: none; user-select: none; }
 
 /* ---------- фон ---------- */
 .bg { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
@@ -51,7 +69,8 @@ button, input { font: inherit; color: inherit; }
 #confetti { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 50; }
 
 /* ---------- шапка ---------- */
-.topbar { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; max-width: 760px; margin: 0 auto; }
+.topbar { display: flex; justify-content: space-between; align-items: center; max-width: 760px; margin: 0 auto;
+  padding: calc(14px + var(--sat)) calc(16px + var(--sar)) 14px calc(16px + var(--sal)); }
 .brand { display: flex; gap: 2px; }
 .brand svg { width: 30px; height: 30px; fill: none; stroke-width: 5; stroke-linecap: round; }
 .brand-x { stroke: var(--x); animation: wiggle 4s ease-in-out infinite; }
@@ -65,7 +84,7 @@ button, input { font: inherit; color: inherit; }
 @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgba(245,185,66,0); } 100% { box-shadow: 0 0 0 0 rgba(245,185,66,0); } }
 @keyframes pulse-ok { 0% { box-shadow: 0 0 0 0 rgba(62,232,155,.6); } 70% { box-shadow: 0 0 0 8px rgba(62,232,155,0); } 100% { box-shadow: 0 0 0 0 rgba(62,232,155,0); } }
 
-main { max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
+main { max-width: 760px; margin: 0 auto; padding: 0 calc(16px + var(--sar)) calc(40px + var(--sab)) calc(16px + var(--sal)); }
 
 /* ---------- экраны ---------- */
 .screen { animation: screenIn .55s cubic-bezier(.2,.9,.3,1.2) both; }
@@ -162,7 +181,7 @@ main { max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
 .turn .dots::after { content: ""; animation: dots 1.5s steps(4) infinite; }
 @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
 
-.board-wrap { position: relative; width: min(100%, 420px); aspect-ratio: 1; margin: 0 auto; }
+.board-wrap { position: relative; width: min(100%, 420px, var(--board-max)); aspect-ratio: 1; margin: 0 auto; }
 .board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: repeat(3, minmax(0, 1fr)); gap: 10px; width: 100%; height: 100%; }
 .cell { position: relative; background: var(--card); border: 1px solid var(--card-border); border-radius: 18px; cursor: default; display: grid; place-items: center; padding: 0; transition: background .2s, transform .15s; backdrop-filter: blur(10px); animation: cellIn .5s cubic-bezier(.2,.9,.3,1.3) both; }
 .board.my-turn .cell.empty { cursor: pointer; }
@@ -193,11 +212,11 @@ main { max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
 .win-line.x line { stroke: #fff; filter: drop-shadow(0 0 12px var(--x)); }
 .win-line.o line { stroke: #fff; filter: drop-shadow(0 0 12px var(--o)); }
 
-.game-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; width: min(100%, 420px); margin-left: auto; margin-right: auto; }
+.game-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; width: min(100%, 420px, var(--board-max)); margin-left: auto; margin-right: auto; }
 .round { color: var(--muted); font-weight: 800; }
 
 /* ---------- результат ---------- */
-.overlay { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; background: rgba(10, 8, 30, .45); backdrop-filter: blur(2px); animation: fadeIn .3s both; padding: 16px; }
+.overlay { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; background: rgba(10, 8, 30, .45); backdrop-filter: blur(2px); animation: fadeIn .3s both; padding: calc(16px + var(--sat)) calc(16px + var(--sar)) calc(16px + var(--sab)) calc(16px + var(--sal)); }
 @keyframes fadeIn { from { opacity: 0; } }
 .result { text-align: center; background: linear-gradient(160deg, rgba(60,45,140,.9), rgba(25,20,60,.95)); border: 1px solid var(--card-border); border-radius: 28px; padding: 30px 36px; min-width: min(320px, 100%); box-shadow: 0 30px 80px rgba(0,0,0,.5); animation: resultIn .6s cubic-bezier(.2,.9,.3,1.4) both; }
 @keyframes resultIn { from { opacity: 0; transform: scale(.5) rotate(-6deg); } to { opacity: 1; transform: none; } }
@@ -211,8 +230,19 @@ main { max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
 .r-next { color: var(--muted); margin-top: 14px; font-size: 14px; }
 .result .btn { margin-top: 18px; }
 
+/* ---------- установка ярлыка ---------- */
+.install-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin: 4px 0 14px; animation: itemIn .5s .3s cubic-bezier(.2,.9,.3,1.3) both; }
+.install-icon { width: 44px; height: 44px; border-radius: 12px; flex: none; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
+.install-text { flex: 1; min-width: 0; }
+.install-title { font-weight: 800; font-size: 15px; }
+.install-sub { color: var(--muted); font-size: 13px; line-height: 1.4; margin-top: 2px; }
+.install-sub .share-ico { display: inline-block; width: 15px; height: 15px; vertical-align: -2px; fill: none; stroke: var(--o); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.install-sub b { color: var(--text); white-space: nowrap; }
+.install-close { flex: none; width: 30px; height: 30px; border-radius: 50%; border: 0; background: rgba(255,255,255,.08); color: var(--muted); cursor: pointer; font-size: 13px; }
+.install-close:hover { background: rgba(255,255,255,.16); }
+
 /* ---------- тосты ---------- */
-.toasts { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); display: grid; gap: 8px; z-index: 60; width: min(92vw, 420px); }
+.toasts { position: fixed; left: 50%; bottom: calc(20px + var(--sab)); transform: translateX(-50%); display: grid; gap: 8px; z-index: 60; width: min(92vw, 420px); }
 .toast { background: rgba(30, 25, 70, .95); border: 1px solid var(--card-border); padding: 12px 16px; border-radius: 14px; box-shadow: 0 10px 30px rgba(0,0,0,.4); animation: toastIn .35s cubic-bezier(.2,.9,.3,1.3) both; font-weight: 600; }
 .toast.err { border-color: rgba(255,94,108,.6); }
 .toast.out { animation: toastOut .3s forwards; }
@@ -226,6 +256,19 @@ main { max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
   .p-score { font-size: 28px; }
   .p-name { font-size: 13px; }
   .result { padding: 26px 22px; }
+}
+/* запуск с ярлыка: экран без адресной строки */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  .install-card { display: none !important; }
+}
+/* низкие экраны (маленькие телефоны) */
+@media (max-height: 700px) {
+  :root { --chrome: 320px; }
+  .title { margin-top: 6px; }
+  .turn { margin: 10px 0 8px; }
+  .scoreboard .player { padding: 8px; }
+  .p-mark { width: 30px; height: 30px; }
+  .game-foot { margin-top: 10px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }

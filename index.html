@@ -6,7 +6,17 @@
   <title>Крестики-нолики онлайн</title>
   <meta name="description" content="Сетевые крестики-нолики: создай игру или подключись к сопернику.">
   <meta name="theme-color" content="#0f0c29">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%231b1640'/%3E%3Cpath d='M28 28L72 72M72 28L28 72' stroke='%23ff5e9c' stroke-width='12' stroke-linecap='round'/%3E%3C/svg%3E">
+  <meta name="color-scheme" content="dark">
+  <meta name="format-detection" content="telephone=no">
+  <!-- режим «ярлыка» (PWA) -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Крестики">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;800;900&display=swap" rel="stylesheet">
@@ -30,6 +40,15 @@
   <main>
     <!-- ЛОББИ -->
     <section class="screen" id="screen-lobby">
+      <div class="card install-card hidden" id="installCard">
+        <img src="icons/icon-192.png" alt="" class="install-icon">
+        <div class="install-text">
+          <div class="install-title">Установи игру на телефон</div>
+          <div class="install-sub" id="installSub">Ярлык на главном экране, игра на весь экран</div>
+        </div>
+        <button class="btn primary small hidden" id="installBtn">Установить</button>
+        <button class="install-close" id="installClose" aria-label="Скрыть">✕</button>
+      </div>
       <h1 class="title">
         <span class="t-x">Крестики</span><span class="t-dash">-</span><span class="t-o">нолики</span>
       </h1>
