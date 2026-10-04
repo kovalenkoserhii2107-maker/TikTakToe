@@ -1,6 +1,6 @@
 // Service worker: нужен для установки ярлыка и быстрого запуска.
 // Стратегия «сначала сеть»: всегда берём свежую версию, кэш — только если сети нет.
-const CACHE = 'ttt-v2';
+const CACHE = 'ttt-v3';
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'vendor/mqtt.min.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',

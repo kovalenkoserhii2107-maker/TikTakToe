@@ -2,12 +2,12 @@
   'use strict';
 
   // ---------- настройки сети ----------
-  // Своего сервера нет: каждое устройство хранит полную копию партии
-  // (историю ходов) и само считает по ней доску, счёт и очередь хода.
-  // Сообщения между устройствами идут через публичный MQTT-брокер по WebSocket,
-  // он только пересылает их. Брокер можно переопределить параметром
-  // ?broker=wss://host:port/path
-  const PREFIX = 'tiktaktoe-ks/v1';
+  // Своего сервера нет: каждое устройство хранит полную копию партии —
+  // журнал событий (ходы, вход и выход игроков) — и само считает по нему
+  // доску, очки, очередь и кто сейчас за столом. Сообщения между устройствами
+  // идут через публичный MQTT-брокер по WebSocket, он только пересылает их.
+  // Брокер можно переопределить параметром ?broker=wss://host:port/path
+  const PREFIX = 'tiktaktoe-ks/v2';
   const params = new URLSearchParams(location.search);
   const BROKERS = params.get('broker')
     ? [params.get('broker')]
@@ -15,9 +15,17 @@
   const PRESENCE_EVERY = 20000;   // как часто обновлять своё присутствие
   const PRESENCE_TTL = 75000;     // через сколько считать игрока пропавшим
   const NEXT_ROUND_DELAY = 3500;
-  const JOIN_TIMEOUT = 8000;
+  const JOIN_TIMEOUT = 12000;
+  const MAX_PLAYERS = 3;
+  const PTS_WIN = 2;
+  const PTS_DRAW = 1;
+  const STORE_KEY = 'ttt-game2';
 
   const LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+  const ID_RE = /^[a-z0-9]{6,24}$/;
+  const TOKEN_RE = /^(?:[0-8]|[+-][a-z0-9]{6,24})$/;
+  const X_SVG = '<svg viewBox="0 0 40 40"><path d="M11 11L29 29M29 11L11 29"/></svg>';
+  const O_SVG = '<svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="10"/></svg>';
 
   const $ = (id) => document.getElementById(id);
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
@@ -27,14 +35,14 @@
     name: safeStorage('get', 'ttt-name') || '',
     status: 'lobby', // lobby | waiting | playing
   };
-  const players = new Map(); // id -> { name, status, game, seen }
+  const players = new Map(); // id -> { name, status, game, members, names, seen }
   let client = null;
   let brokerIdx = 0;
   let pendingJoin = null;
-  // Текущая партия. Хранится на обоих устройствах и переживает закрытие приложения.
-  // moves — строка из номеров клеток (0–8) по порядку за все раунды.
+  // Текущая партия: { id, log: [...события], names: {id: имя}, pending: [...], ms: {id: статус}, ui }
+  // log: '0'–'8' — ход в клетку, '+id' — игрок вошёл, '-id' — игрок вышел.
   let game = null;
-
+  safeStorage('remove', 'ttt-game'); // партии прежней версии несовместимы
   game = loadGame();
 
   // ---------- утилиты ----------
@@ -49,7 +57,7 @@
 
   function loadId() {
     let id = safeStorage('get', 'ttt-id');
-    if (!id || !/^[a-z0-9]{6,24}$/.test(id)) {
+    if (!id || !ID_RE.test(id)) {
       id = uid();
       safeStorage('set', 'ttt-id', id);
     }
@@ -65,7 +73,7 @@
     el.className = 'toast' + (type === 'err' ? ' err' : '');
     el.textContent = text;
     $('toasts').appendChild(el);
-    setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 300); }, 3200);
+    setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 300); }, 3400);
   }
 
   function showScreen(name) {
@@ -78,6 +86,11 @@
     let h = 0;
     for (const ch of str) h = (h * 31 + ch.charCodeAt(0)) % 360;
     return h;
+  }
+
+  function avatarBg(id) {
+    const h = hueOf(id);
+    return `linear-gradient(135deg, hsl(${h} 85% 62%), hsl(${(h + 50) % 360} 85% 52%))`;
   }
 
   function ask(html, okLabel) {
@@ -101,21 +114,54 @@
     return d.innerHTML;
   }
 
+  function nameOf(id) {
+    if (id === me.id) return me.name || 'Ты';
+    return (game && game.names[id]) || (players.get(id) || {}).name || 'Игрок';
+  }
+
+  function listNames(ids) {
+    const n = ids.map(nameOf);
+    return n.length > 1 ? n.slice(0, -1).join(', ') + ' и ' + n[n.length - 1] : (n[0] || '');
+  }
+
   // ---------- хранение партии ----------
-  function newGame(id, oppId, oppName, firstId) {
-    return { id, oppId, oppName, firstId, moves: '', oppState: 'offline', ui: freshUi() };
+  function makeGame(id, log, names) {
+    return { id, log, names: names || {}, pending: [], ms: {}, ui: freshUi() };
   }
 
   function freshUi() {
-    return { round: 0, finished: 0, advanced: 0, lineRound: 0, nextTimer: null, overlayTimer: null, score: null, openedAt: Date.now() };
+    return { round: -1, finished: 0, advanced: 0, lineRound: 0, nextTimer: null, overlayTimer: null,
+      pts: null, members: null, openedAt: Date.now() };
+  }
+
+  function sanitizeLog(log) {
+    if (!Array.isArray(log)) return [];
+    const out = [];
+    for (const t of log.slice(0, 20000)) {
+      if (typeof t !== 'string' || !TOKEN_RE.test(t)) break;
+      out.push(t);
+    }
+    return out.slice(0, replay(out).valid);
+  }
+
+  function sanitizeNames(n) {
+    const res = {};
+    if (n && typeof n === 'object') {
+      for (const [k, v] of Object.entries(n)) if (ID_RE.test(k)) res[k] = cleanName(v) || 'Игрок';
+    }
+    return res;
   }
 
   function loadGame() {
     try {
-      const g = JSON.parse(safeStorage('get', 'ttt-game') || 'null');
-      if (!g || typeof g.id !== 'string' || typeof g.oppId !== 'string' || typeof g.firstId !== 'string') return null;
-      const res = newGame(g.id, g.oppId, cleanName(g.oppName) || 'Игрок', g.firstId);
-      res.moves = sanitizeMoves(res, g.moves);
+      const g = JSON.parse(safeStorage('get', STORE_KEY) || 'null');
+      if (!g || typeof g.id !== 'string') return null;
+      const res = makeGame(g.id, sanitizeLog(g.log), sanitizeNames(g.names));
+      // без соперника партия не начиналась — нечего восстанавливать
+      if (replay(res.log).players.length < 2 || !replay(res.log).players.includes(me.id)) {
+        safeStorage('remove', STORE_KEY);
+        return null;
+      }
       return res;
     } catch (e) {
       return null;
@@ -124,36 +170,53 @@
 
   function saveGame() {
     if (!game) return;
-    const { id, oppId, oppName, firstId, moves } = game;
-    safeStorage('set', 'ttt-game', JSON.stringify({ id, oppId, oppName, firstId, moves }));
-  }
-
-  function endedList() {
-    try { return JSON.parse(safeStorage('get', 'ttt-ended') || '[]'); } catch (e) { return []; }
+    safeStorage('set', STORE_KEY, JSON.stringify({ id: game.id, log: game.log, names: game.names }));
   }
 
   function dropGame() {
     if (!game) return;
     clearTimeout(game.ui.nextTimer);
     clearTimeout(game.ui.overlayTimer);
-    const ended = endedList().filter((x) => x !== game.id);
-    ended.push(game.id);
-    safeStorage('set', 'ttt-ended', JSON.stringify(ended.slice(-30)));
-    safeStorage('remove', 'ttt-game');
+    safeStorage('remove', STORE_KEY);
     game = null;
   }
 
-  // ---------- правила: состояние считается из истории ходов ----------
-  function otherId(id) { return id === me.id ? game.oppId : me.id; }
+  // ---------- правила: всё состояние считается из журнала ----------
+  function other(pair, id) { return pair[0] === id ? pair[1] : pair[0]; }
 
-  // Право первого хода чередуется каждый раунд
-  function firstOfRound(r) {
-    return r % 2 === 1 ? game.firstId : otherId(game.firstId);
+  // Кто сядет за стол в следующем раунде и кто ходит первым.
+  // Победитель остаётся, проигравший уступает место ожидающему.
+  // При ничьей уходит тот, кто дольше сидит за столом. Новичок ходит первым.
+  function nextSetup(st) {
+    const P = st.players;
+    if (P.length < 2) return null;
+    if (!st.pair) return { pair: [P[0], P[1]], first: P[1] };
+    const prev = st.pair.filter((id) => P.includes(id));
+    const waiting = P.filter((id) => !prev.includes(id));
+    if (prev.length === 2) {
+      if (!waiting.length) {
+        // те же двое — право первого хода переходит к другому
+        return { pair: prev, first: other(prev, st.first) };
+      }
+      let out;
+      const w = st.result && st.result.winner;
+      if (w) out = other(prev, w);
+      else {
+        const [a, b] = prev;
+        out = st.since[a] < st.since[b] ? a : st.since[b] < st.since[a] ? b : st.first;
+      }
+      const inn = waiting[0];
+      return { pair: [other(prev, out), inn], first: inn };
+    }
+    if (prev.length === 1) {
+      const inn = waiting[0];
+      return { pair: [prev[0], inn], first: inn };
+    }
+    return { pair: [waiting[0], waiting[1]], first: waiting[1] };
   }
 
-  function moverOf(r, k) {
-    const first = firstOfRound(r);
-    return (k % 2 === 0 ? first : otherId(first)) === me.id ? 'me' : 'opp';
+  function moverOf(st) {
+    return st.k % 2 === 0 ? st.first : other(st.pair, st.first);
   }
 
   function checkBoard(b) {
@@ -165,56 +228,94 @@
     return null;
   }
 
-  function replay(moves, g) {
-    const saved = game;
-    if (g) game = g;
-    const s = { round: 1, board: Array(9).fill(null), score: { me: 0, opp: 0, draw: 0 }, over: false, result: null, valid: 0 };
-    let start = 0;
-    for (let i = 0; i < moves.length; i++) {
-      if (s.over) {
-        s.round++;
-        s.board = Array(9).fill(null);
-        s.over = false;
-        s.result = null;
-        start = i;
+  function replay(log) {
+    const st = {
+      players: [], pair: null, first: null, board: Array(9).fill(null), k: 0,
+      round: 0, over: true, result: null, since: {}, pts: {}, wins: {}, draws: {}, order: {}, valid: 0, seq: 0,
+    };
+    const startRound = () => {
+      const nx = nextSetup(st);
+      if (!nx) return false;
+      st.round++;
+      // запоминаем, с какого раунда игрок сидит за столом
+      for (const id of nx.pair) if (!st.pair || !st.pair.includes(id)) st.since[id] = st.round;
+      st.pair = nx.pair;
+      st.first = nx.first;
+      st.board = Array(9).fill(null);
+      st.k = 0;
+      st.over = false;
+      st.result = null;
+      return true;
+    };
+    for (let i = 0; i < log.length; i++) {
+      const t = log[i];
+      if (t[0] === '+') {
+        const id = t.slice(1);
+        if (st.players.includes(id) || st.players.length >= MAX_PLAYERS) break;
+        if (!st.players.length && i !== 0) break;
+        st.players.push(id);
+        if (!(id in st.pts)) { st.pts[id] = 0; st.wins[id] = 0; st.draws[id] = 0; st.order[id] = st.seq++; }
+      } else if (t[0] === '-') {
+        const id = t.slice(1);
+        if (!st.players.includes(id)) break;
+        st.players = st.players.filter((x) => x !== id);
+        if (st.pair && st.pair.includes(id) && !st.over) {
+          // игрок ушёл посреди раунда — раунд не засчитывается
+          st.over = true;
+          st.result = { aborted: true };
+        }
+      } else {
+        if (st.over && !startRound()) break;
+        const cell = +t;
+        if (st.board[cell]) break;
+        const who = moverOf(st);
+        st.board[cell] = who;
+        st.k++;
+        const res = checkBoard(st.board);
+        if (res) {
+          st.over = true;
+          st.result = res;
+          if (res.winner) {
+            st.pts[res.winner] += PTS_WIN;
+            st.wins[res.winner]++;
+          } else {
+            for (const id of st.pair) { st.pts[id] += PTS_DRAW; st.draws[id]++; }
+          }
+        }
       }
-      const cell = moves.charCodeAt(i) - 48;
-      if (!(cell >= 0 && cell <= 8) || s.board[cell]) break;
-      s.board[cell] = moverOf(s.round, i - start);
-      s.valid = i + 1;
-      const res = checkBoard(s.board);
-      if (res) {
-        s.over = true;
-        s.result = res;
-        if (res.winner) s.score[res.winner]++;
-        else s.score.draw++;
-      }
+      st.valid = i + 1;
     }
-    s.turn = s.over ? null : moverOf(s.round, s.valid - start);
-    game = saved;
-    return s;
+    return st;
   }
 
-  function sanitizeMoves(g, moves) {
-    moves = typeof moves === 'string' ? moves.replace(/[^0-8]/g, '').slice(0, 5000) : '';
-    return moves.slice(0, replay(moves, g).valid);
+  // Писать в журнал в каждый момент может ровно один игрок — тот, чей ход
+  // (а между раундами — тот, кто ходит первым в следующем). Поэтому копии
+  // журнала на разных устройствах всегда продолжают друг друга.
+  function appenderOf(st) {
+    if (st.players.length < 2) return st.players[0] || null;
+    if (!st.over && st.pair) return moverOf(st);
+    const nx = nextSetup(st);
+    return nx ? nx.first : null;
   }
 
-  // Две копии одной партии: берём более полную. Ходить может только тот,
-  // чья очередь, поэтому одна копия всегда продолжение другой.
-  function mergeMoves(a, b) {
-    if (a === b || a.startsWith(b)) return a;
-    if (b.startsWith(a)) return b;
+  function mergeLogs(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a[i] === b[i]) i++;
+    if (i === n) return a.length >= b.length ? a : b;
     if (a.length !== b.length) return a.length > b.length ? a : b;
-    return a < b ? a : b; // одинаковое правило на обоих устройствах
+    return JSON.stringify(a) < JSON.stringify(b) ? a : b; // одинаковое правило на всех устройствах
   }
 
-  // что показывать: после конца раунда и паузы — уже пустое поле следующего
-  function view(s) {
-    if (s.over && game.ui.advanced === s.round) {
-      return { round: s.round + 1, board: Array(9).fill(null), over: false, result: null, score: s.score, turn: moverOf(s.round + 1, 0) };
+  // Что показывать: текущий раунд или (после паузы) уже следующий.
+  function view(st) {
+    const ui = game.ui;
+    if (st.over && (st.round === 0 || st.result?.aborted || ui.advanced === st.round)) {
+      const nx = nextSetup(st);
+      if (!nx) return { round: st.round, pair: null, board: Array(9).fill(null), over: false, waitingPlayers: true };
+      return { round: st.round + 1, pair: nx.pair, first: nx.first, board: Array(9).fill(null), over: false, result: null, turn: nx.first };
     }
-    return s;
+    return { round: st.round, pair: st.pair, first: st.first, board: st.board, over: st.over, result: st.result, turn: st.over ? null : moverOf(st) };
   }
 
   // ---------- сеть ----------
@@ -228,9 +329,6 @@
     el.classList.toggle('online', state === 'online');
     el.classList.toggle('offline', state === 'offline');
     $('connText').textContent = text;
-    const ms = $('meState');
-    ms.className = 'opp-state ' + (state === 'online' ? 'ingame' : state === 'offline' ? 'offline' : 'lobby');
-    ms.textContent = state === 'online' ? 'в сети' : state === 'offline' ? 'нет связи' : 'подключение…';
   }
 
   function connect() {
@@ -271,22 +369,31 @@
   }
 
   function send(id, msg) {
-    if (!client || !client.connected) return;
+    if (!client || !client.connected || id === me.id) return;
     msg.from = me.id;
     client.publish(topic.inbox(id), JSON.stringify(msg), { qos: 1 });
   }
 
-  function sendState() {
+  function stateMsg() {
+    return { t: 'state', game: game.id, log: game.log, names: { ...game.names, [me.id]: me.name || 'Игрок' } };
+  }
+
+  // отправить свою копию партии всем участникам (или одному)
+  function sendState(to) {
     if (!game) return;
-    send(game.oppId, { t: 'state', game: game.id, moves: game.moves, first: game.firstId, name: me.name });
+    const ids = to ? [to] : replay(game.log).players;
+    for (const id of ids) send(id, stateMsg());
   }
 
   function publishPresence() {
     if (!client || !client.connected) return;
+    const members = game ? replay(game.log).players : [];
     const payload = JSON.stringify({
       name: me.name || 'Игрок',
       status: me.status,
       game: game ? game.id : null,
+      members,
+      names: members.map(nameOf),
       ts: Date.now(),
     });
     client.publish(topic.player(me.id), payload, { qos: 1, retain: true });
@@ -313,129 +420,185 @@
         try { p = JSON.parse(text); } catch (e) { return; }
         // для сохранённых (retained) сообщений доверяем метке времени отправителя
         const seen = packet.retain ? Number(p.ts) || 0 : Date.now();
-        players.set(id, { name: cleanName(p.name) || 'Игрок', status: p.status, game: p.game || null, seen });
+        const members = Array.isArray(p.members) ? p.members.filter((x) => typeof x === 'string' && ID_RE.test(x)).slice(0, MAX_PLAYERS) : [];
+        const names = Array.isArray(p.names) ? p.names.slice(0, MAX_PLAYERS).map((x) => cleanName(x) || 'Игрок') : [];
+        players.set(id, { name: cleanName(p.name) || 'Игрок', status: p.status, game: typeof p.game === 'string' ? p.game : null, members, names, seen });
       }
-      refreshOpp();
+      refreshMembers();
       renderLobby();
       return;
     }
     if (t === topic.inbox(me.id)) {
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
-      if (msg && typeof msg.from === 'string') handleDirect(msg);
+      if (msg && typeof msg.from === 'string' && ID_RE.test(msg.from)) handleDirect(msg);
     }
   }
 
   function handleDirect(msg) {
     switch (msg.t) {
       case 'join': {
-        if (me.status === 'waiting' && !game) {
-          const first = Math.random() < 0.5 ? me.id : msg.from;
-          const id = uid();
-          game = newGame(id, msg.from, cleanName(msg.name) || 'Игрок', first);
-          saveGame();
-          send(msg.from, { t: 'accept', game: id, name: me.name, first });
-          toast(`Соперник: ${game.oppName}. Игра началась!`);
-          openGame(true);
-        } else {
-          send(msg.from, { t: 'busy' });
+        // кто-то просится в нашу партию (вторым или третьим)
+        if (!game || msg.game !== game.id) { send(msg.from, { t: 'busy', game: msg.game }); return; }
+        const st = replay(game.log);
+        if (st.players.includes(msg.from)) { sendState(msg.from); return; }
+        if (st.players.length >= MAX_PLAYERS) { send(msg.from, { t: 'busy', game: msg.game }); return; }
+        if (!game.pending.some((op) => op.op === '+' && op.id === msg.from)) {
+          game.pending.push({ op: '+', id: msg.from, name: cleanName(msg.name) || 'Игрок' });
         }
-        break;
-      }
-      case 'accept': {
-        if (!pendingJoin || pendingJoin.id !== msg.from || game || typeof msg.game !== 'string') {
-          // соперник принял, а мы уже передумали — сообщаем ему
-          if (typeof msg.game === 'string') send(msg.from, { t: 'end', game: msg.game });
-          return;
-        }
-        clearTimeout(pendingJoin.timer);
-        pendingJoin = null;
-        const first = msg.first === me.id ? me.id : msg.from;
-        game = newGame(msg.game, msg.from, cleanName(msg.name) || 'Игрок', first);
-        saveGame();
-        toast(`Соперник: ${game.oppName}. Игра началась!`);
-        openGame(true);
+        flushPending();
         break;
       }
       case 'busy': {
-        if (pendingJoin && pendingJoin.id === msg.from) {
+        if (pendingJoin && pendingJoin.game === msg.game) {
           clearTimeout(pendingJoin.timer);
           pendingJoin = null;
           renderLobby();
-          toast('Эта игра уже занята', 'err');
+          toast('В этой игре уже нет мест', 'err');
         }
         break;
       }
       case 'state': {
-        if (!game || msg.game !== game.id || msg.from !== game.oppId) {
-          // партия уже завершена у нас — напоминаем сопернику
-          if (endedList().includes(msg.game)) send(msg.from, { t: 'end', game: msg.game });
-          return;
-        }
         onState(msg);
         break;
       }
+      case 'leave':
+      case 'gone': {
+        // игрок покинул партию (или давно вышел, а мы не знали)
+        if (!game || msg.game !== game.id) return;
+        const st = replay(game.log);
+        if (!st.players.includes(msg.from)) return;
+        if (st.players.length <= 2) { partyEnded(msg.from); return; }
+        if (!game.pending.some((op) => op.op === '-' && op.id === msg.from)) game.pending.push({ op: '-', id: msg.from });
+        flushPending();
+        break;
+      }
       case 'end': {
-        if (game && msg.game === game.id && msg.from === game.oppId) opponentEnded();
+        if (game && msg.game === game.id && replay(game.log).players.includes(msg.from)) partyEnded(msg.from);
         break;
       }
     }
   }
 
   function onState(msg) {
-    const name = cleanName(msg.name);
-    if (name && name !== game.oppName) {
-      game.oppName = name;
-      saveGame();
-      updateNames();
+    if (typeof msg.game !== 'string') return;
+    const theirs = sanitizeLog(msg.log);
+    const theirPlayers = replay(theirs).players;
+    const names = sanitizeNames(msg.names);
+
+    if (!game || game.id !== msg.game) {
+      // нас приняли в игру, куда мы просились
+      if (pendingJoin && pendingJoin.game === msg.game && theirPlayers.includes(me.id) && !game) {
+        clearTimeout(pendingJoin.timer);
+        pendingJoin = null;
+        game = makeGame(msg.game, theirs, names);
+        delete game.names[me.id];
+        saveGame();
+        toast(`Ты в игре! Игроки: ${listNames(theirPlayers.filter((x) => x !== me.id))}`);
+        openGame(true);
+        return;
+      }
+      // нас считают участником партии, которой у нас уже нет
+      if (theirPlayers.includes(me.id)) send(msg.from, { t: 'gone', game: msg.game });
+      return;
     }
-    const theirs = sanitizeMoves(game, msg.moves);
-    const merged = mergeMoves(game.moves, theirs);
-    if (merged !== game.moves) {
-      game.moves = merged;
-      saveGame();
-      if (me.status === 'playing') render(true);
+    const before = replay(game.log);
+    if (!before.players.includes(msg.from) && !theirPlayers.includes(msg.from)) return;
+    for (const [id, n] of Object.entries(names)) if (id !== me.id) game.names[id] = n;
+    const merged = mergeLogs(game.log, theirs);
+    if (merged !== game.log) {
+      game.log = merged;
+      afterLogChange(before, true);
     }
-    // у соперника копия отстаёт — отправляем ему свою
-    if (merged !== theirs) sendState();
-    renderLobby();
+    // у отправителя копия отстаёт — отправляем ему свою (сравниваем содержимое, иначе пинг-понг)
+    if (game && JSON.stringify(merged) !== JSON.stringify(theirs)) sendState(msg.from);
+    if (game) { refreshMembers(); renderLobby(); }
   }
 
-  // ---------- соперник: в игре / в лобби / не в сети ----------
-  function oppStateNow() {
-    const p = players.get(game.oppId);
+  // Применить отложенные изменения состава, если сейчас наша очередь писать в журнал.
+  function flushPending() {
+    if (!game || !game.pending.length) return;
+    const before = replay(game.log);
+    let changed = false;
+    for (let guard = 0; guard < 10 && game.pending.length; guard++) {
+      const st = replay(game.log);
+      if (appenderOf(st) !== me.id) break;
+      const op = game.pending.shift();
+      if (op.op === '+') {
+        if (st.players.includes(op.id)) continue;
+        if (st.players.length >= MAX_PLAYERS) { send(op.id, { t: 'busy', game: game.id }); continue; }
+        game.log = [...game.log, '+' + op.id];
+        game.names[op.id] = op.name;
+      } else {
+        if (!st.players.includes(op.id)) continue;
+        game.log = [...game.log, '-' + op.id];
+      }
+      changed = true;
+    }
+    if (changed) {
+      afterLogChange(before, true);
+      sendState();
+      // ушедшему тоже сообщаем, что его выход учтён
+    }
+  }
+
+  // Журнал изменился: сохранить, объявить новичков/ушедших, перерисовать.
+  function afterLogChange(before, live) {
+    const st = replay(game.log);
+    if (!st.players.includes(me.id)) { dropGame(); showScreen('lobby'); setStatus('lobby'); renderLobby(); return; }
+    saveGame();
+    const joined = st.players.filter((id) => !before.players.includes(id) && id !== me.id);
+    const left = before.players.filter((id) => !st.players.includes(id) && id !== me.id);
+    if (me.status === 'waiting' && st.players.length >= 2) {
+      toast(`Соперник: ${nameOf(joined[0] || st.players.find((x) => x !== me.id))}. Игра началась!`);
+      openGame(true);
+      sendState();
+      return;
+    }
+    if (st.players.length < 2) { partyEnded(left[0]); return; }
+    for (const id of joined) {
+      if (before.players.length >= 2) toast(`${nameOf(id)} присоединяется! Сыграет с победителем раунда`);
+    }
+    for (const id of left) toast(`${nameOf(id)} покидает игру`);
+    if (joined.length || left.length) publishPresence();
+    if (me.status === 'playing') render(live);
+    flushPending();
+  }
+
+  // ---------- участники: в игре / в лобби / не в сети ----------
+  function memberState(id) {
+    if (id === me.id) return client && client.connected ? 'ingame' : 'offline';
+    const p = players.get(id);
     if (!p || Date.now() - p.seen > PRESENCE_TTL) return 'offline';
     return p.status === 'playing' && p.game === game.id ? 'ingame' : 'lobby';
   }
 
-  const OPP_TEXT = { ingame: 'в игре', lobby: 'в лобби', offline: 'не в сети' };
+  const STATE_TEXT = { ingame: 'в игре', lobby: 'в лобби', offline: 'не в сети' };
 
-  function refreshOpp() {
+  function refreshMembers() {
     if (!game) return;
-    const p = players.get(game.oppId);
-    if (p && p.name && p.name !== game.oppName && p.name !== 'Игрок') {
-      game.oppName = p.name;
-      saveGame();
-      updateNames();
-    }
-    const prev = game.oppState;
-    const now = oppStateNow();
-    game.oppState = now;
-    // сразу после открытия список игроков ещё догружается — не шумим уведомлениями
+    const st = replay(game.log);
     const settled = Date.now() - game.ui.openedAt > 4000;
-    if (prev !== now) {
-      if (now === 'ingame') {
-        sendState(); // соперник вернулся — отдаём ему свою копию партии
-        if (me.status === 'playing' && settled) toast(`${game.oppName} снова в игре!`);
-      } else if (prev === 'ingame' && me.status === 'playing' && settled) {
-        toast(now === 'offline'
-          ? `${game.oppName}: нет связи. Игра сохранена — продолжите, когда соперник вернётся`
-          : `${game.oppName} сейчас в лобби. Игра сохранена`);
+    for (const id of st.players) {
+      if (id === me.id) continue;
+      const p = players.get(id);
+      if (p && p.name && p.name !== 'Игрок' && p.name !== game.names[id]) { game.names[id] = p.name; saveGame(); }
+      const prev = game.ms[id];
+      const now = memberState(id);
+      game.ms[id] = now;
+      if (prev && prev !== now) {
+        if (now === 'ingame') {
+          sendState(id); // игрок вернулся — отдаём ему свою копию партии
+          if (me.status === 'playing' && settled) toast(`${nameOf(id)} снова в игре!`);
+        } else if (prev === 'ingame' && me.status === 'playing' && settled) {
+          toast(now === 'offline'
+            ? `${nameOf(id)}: нет связи. Игра сохранена — продолжите, когда игрок вернётся`
+            : `${nameOf(id)} сейчас в лобби. Игра сохранена`);
+        }
+      } else if (!prev && now === 'ingame') {
+        sendState(id);
       }
     }
-    const el = $('oppState');
-    el.className = 'opp-state ' + now;
-    el.textContent = OPP_TEXT[now];
     if (me.status === 'playing') render(false);
   }
 
@@ -457,67 +620,92 @@
     return true;
   }
 
+  // Игры, к которым можно подключиться: кто-то ждёт соперника или двое уже играют.
+  function openGames() {
+    const now = Date.now();
+    const games = new Map();
+    for (const [id, p] of players) {
+      if (now - p.seen > PRESENCE_TTL || !p.game) continue;
+      if (game && p.game === game.id) continue;
+      if (p.status !== 'waiting' && p.status !== 'playing') continue;
+      if (!p.members.includes(id)) continue;
+      const g = games.get(p.game);
+      if (!g || p.members.length > g.members.length || (p.members.length === g.members.length && p.seen > g.ts)) {
+        games.set(p.game, { id: p.game, members: p.members, names: p.names, ts: p.seen, waiting: p.status === 'waiting' });
+      }
+    }
+    return [...games.values()].filter((g) => g.members.length >= 1 && g.members.length < MAX_PLAYERS && !g.members.includes(me.id));
+  }
+
   function renderLobby() {
     const now = Date.now();
     const list = $('lobbyList');
     let online = 1;
-    const waiting = [];
-    for (const [id, p] of players) {
-      if (now - p.seen > PRESENCE_TTL) continue;
-      online++;
-      if (p.status === 'waiting') waiting.push([id, p]);
-    }
-    waiting.sort((a, b) => a[1].name.localeCompare(b[1].name));
+    for (const p of players.values()) if (now - p.seen <= PRESENCE_TTL) online++;
     $('onlineCount').textContent = 'онлайн: ' + (client && client.connected ? online : 0);
 
-    const keep = new Set(waiting.map(([id]) => id));
+    const items = openGames().sort((a, b) => a.members.length - b.members.length || a.id.localeCompare(b.id));
+    const keep = new Set(items.map((g) => g.id));
     for (const li of [...list.children]) {
       if (!keep.has(li.dataset.id) && !li.classList.contains('leaving')) {
         li.classList.add('leaving');
         setTimeout(() => li.remove(), 300);
       }
     }
-    for (const [id, p] of waiting) {
-      let li = list.querySelector(`li[data-id="${CSS.escape(id)}"]:not(.leaving)`);
+    for (const g of items) {
+      let li = list.querySelector(`li[data-id="${CSS.escape(g.id)}"]:not(.leaving)`);
       if (!li) {
         li = document.createElement('li');
         li.className = 'lobby-item';
-        li.dataset.id = id;
-        li.innerHTML = '<div class="avatar"></div><div class="li-info"><div class="li-name"></div>' +
-          '<div class="li-status">ждёт соперника</div></div><button class="btn join">Играть</button>';
-        li.querySelector('button').addEventListener('click', () => joinGame(id));
+        li.dataset.id = g.id;
+        li.innerHTML = '<div class="avatars"></div><div class="li-info"><div class="li-name"></div>' +
+          '<div class="li-status"></div></div><button class="btn join"></button>';
+        li.querySelector('button').addEventListener('click', () => joinGame(li.dataset.id));
         list.appendChild(li);
       }
-      const h = hueOf(id);
-      const av = li.querySelector('.avatar');
-      av.textContent = (p.name[0] || '?').toUpperCase();
-      av.style.background = `linear-gradient(135deg, hsl(${h} 85% 62%), hsl(${(h + 50) % 360} 85% 52%))`;
-      li.querySelector('.li-name').textContent = p.name;
+      const av = li.querySelector('.avatars');
+      av.innerHTML = '';
+      g.members.forEach((id, i) => {
+        const a = document.createElement('div');
+        a.className = 'avatar';
+        a.textContent = ((g.names[i] || '?')[0] || '?').toUpperCase();
+        a.style.background = avatarBg(id);
+        av.appendChild(a);
+      });
+      const two = g.members.length >= 2;
+      li.classList.toggle('busy-game', two);
+      li.querySelector('.li-name').textContent = two ? `${g.names[0] || 'Игрок'} и ${g.names[1] || 'Игрок'}` : (g.names[0] || 'Игрок');
+      li.querySelector('.li-status').textContent = two ? 'играют · можно третьим' : 'ждёт соперника';
       const btn = li.querySelector('button');
-      const joining = pendingJoin && pendingJoin.id === id;
+      const joining = pendingJoin && pendingJoin.game === g.id;
       btn.disabled = !!pendingJoin;
-      btn.textContent = joining ? 'Подключение…' : 'Играть';
+      btn.textContent = joining ? 'Подключение…' : two ? 'Третьим' : 'Играть';
     }
-    $('lobbyEmpty').classList.toggle('hidden', waiting.length !== 0);
+    $('lobbyEmpty').classList.toggle('hidden', items.length !== 0);
 
     // карточка незаконченной партии
     const card = $('resumeCard');
-    card.classList.toggle('hidden', !game);
-    if (game) {
-      const s = replay(game.moves);
-      $('resumeSub').innerHTML = `Соперник: <b>${esc(game.oppName)}</b> · счёт ${s.score.me} : ${s.score.opp}` +
-        (s.score.draw ? ` · ничьих ${s.score.draw}` : '');
-      const st = $('resumeState');
-      const os = oppStateNow();
-      st.className = 'opp-state ' + os;
-      st.textContent = os === 'ingame' ? `${game.oppName} в игре и ждёт тебя` : `${game.oppName} ${OPP_TEXT[os]}`;
+    card.classList.toggle('hidden', !game || me.status === 'waiting');
+    if (game && me.status !== 'waiting') {
+      const st = replay(game.log);
+      const others = st.players.filter((x) => x !== me.id);
+      const place = placeOf(st, me.id);
+      $('resumeSub').innerHTML = `${others.length > 1 ? 'Соперники' : 'Соперник'}: <b>${esc(listNames(others))}</b> · ` +
+        `у тебя ${st.pts[me.id] || 0} очк. · ${place} место`;
+      const stEl = $('resumeState');
+      const states = others.map((id) => memberState(id));
+      const best = states.includes('ingame') ? 'ingame' : states.includes('lobby') ? 'lobby' : 'offline';
+      stEl.className = 'opp-state ' + best;
+      const inGame = others.filter((id, i) => states[i] === 'ingame');
+      stEl.textContent = inGame.length ? `${listNames(inGame)} в игре и ${inGame.length > 1 ? 'ждут' : 'ждёт'} тебя`
+        : others.map((id, i) => `${nameOf(id)} ${STATE_TEXT[states[i]]}`).join(' · ');
     }
   }
 
   async function confirmDropSaved() {
     if (!game) return true;
-    const ok = await ask(`У тебя есть незаконченная игра (соперник: <b>${esc(game.oppName)}</b>).<br>Завершить её и начать новую?`, 'Завершить');
-    if (ok) endGameByMe();
+    const ok = await ask('У тебя есть незаконченная игра.<br>Выйти из неё и начать новую?', 'Выйти');
+    if (ok) leaveGameByMe();
     return ok;
   }
 
@@ -525,53 +713,55 @@
     if (!requireName()) return;
     if (!client || !client.connected) { toast('Нет подключения к сети, подожди немного', 'err'); return; }
     if (!(await confirmDropSaved())) return;
-    setStatus('waiting');
+    game = makeGame(uid(), ['+' + me.id], {});
+    me.status = 'waiting';
+    publishPresence();
     showScreen('wait');
   }
 
   function cancelWait() {
+    // в партии никого, кроме нас, — просто забываем её
+    if (game && replay(game.log).players.length < 2) dropGame();
     setStatus('lobby');
     showScreen('lobby');
     renderLobby();
   }
 
-  async function joinGame(id) {
+  async function joinGame(gid) {
     if (pendingJoin) return;
     if (!requireName()) return;
     if (!client || !client.connected) { toast('Нет подключения к сети', 'err'); return; }
+    const g = openGames().find((x) => x.id === gid);
+    if (!g) { toast('Эта игра уже недоступна', 'err'); return; }
     if (!(await confirmDropSaved())) return;
     publishPresence();
     pendingJoin = {
-      id,
+      game: gid,
       timer: setTimeout(() => {
         pendingJoin = null;
         renderLobby();
-        toast('Игрок не отвечает', 'err');
+        toast('Игроки не отвечают — попробуй позже', 'err');
       }, JOIN_TIMEOUT),
     };
-    send(id, { t: 'join', name: me.name });
+    // просимся у всех участников: впишет нас тот, чья сейчас очередь
+    for (const id of g.members) send(id, { t: 'join', game: gid, name: me.name });
     renderLobby();
   }
 
   // ---------- игра ----------
-  function updateNames() {
+  function openGame(live) {
     if (!game) return;
-    $('meName').textContent = (me.name || 'Ты') + ' (ты)';
-    $('oppName').textContent = game.oppName;
-  }
-
-  function openGame(isNew) {
-    if (!game) return;
+    clearTimeout(game.ui.nextTimer);
+    clearTimeout(game.ui.overlayTimer);
     game.ui = freshUi();
-    game.oppState = oppStateNow();
     me.status = 'playing';
     publishPresence();
     sendState();
-    updateNames();
     $('overlay').classList.add('hidden');
+    $('podium').querySelectorAll('.ptoken').forEach((el) => el.remove());
     showScreen('game');
-    refreshOpp();
-    render(isNew);
+    for (const id of replay(game.log).players) if (id !== me.id) game.ms[id] = memberState(id);
+    render(live);
   }
 
   function pauseGame() {
@@ -585,48 +775,150 @@
     renderLobby();
   }
 
-  function endGameByMe() {
+  // Выйти из партии насовсем. Вдвоём — партия заканчивается для обоих,
+  // втроём — оставшиеся двое продолжают.
+  function leaveGameByMe() {
     if (!game) return;
-    send(game.oppId, { t: 'end', game: game.id });
+    const st = replay(game.log);
+    const others = st.players.filter((x) => x !== me.id);
+    if (st.players.length <= 2) {
+      for (const id of others) send(id, { t: 'end', game: game.id });
+    } else if (appenderOf(st) === me.id) {
+      game.log = [...game.log, '-' + me.id];
+      for (const id of others) send(id, stateMsg());
+    } else {
+      for (const id of others) send(id, { t: 'leave', game: game.id });
+    }
     dropGame();
     publishPresence();
   }
 
   async function endGameClick() {
     if (!game) return;
-    const s = replay(game.moves);
-    const ok = await ask(`Завершить игру? Соперник: <b>${esc(game.oppName)}</b>.<br>Счёт ${s.score.me} : ${s.score.opp} — продолжить её будет нельзя.`, 'Завершить');
+    const st = replay(game.log);
+    const three = st.players.length > 2;
+    const ok = await ask(three
+      ? 'Покинуть игру?<br>Остальные продолжат без тебя, вернуться в эту партию будет нельзя.'
+      : `Завершить игру? Соперник: <b>${esc(listNames(st.players.filter((x) => x !== me.id)))}</b>.<br>Продолжить её будет нельзя.`,
+    three ? 'Покинуть' : 'Завершить');
     if (!ok || !game) return;
-    endGameByMe();
+    leaveGameByMe();
     pauseGame();
   }
 
-  function opponentEnded() {
-    const s = replay(game.moves);
-    const name = game.oppName;
+  // Партия закончилась: в ней не осталось соперников.
+  function partyEnded(byId) {
+    if (!game) return;
+    const st = replay(game.log);
+    const name = byId ? nameOf(byId) : 'Соперник';
+    const pts = st.pts[me.id] || 0;
+    const place = placeOf(st, me.id);
     const wasPlaying = me.status === 'playing';
     dropGame();
     publishPresence();
     if (!wasPlaying) {
-      toast(`Соперник ${name} завершил вашу игру`);
+      toast(`${name}: игра завершена`);
       renderLobby();
       return;
     }
     $('board').classList.remove('my-turn');
-    $('pMe').classList.remove('active');
-    $('pOpp').classList.remove('active');
     $('turnInfo').textContent = '';
     $('rIcon').textContent = '👋';
     const rt = $('rTitle');
     rt.textContent = 'Игра завершена';
     rt.className = 'r-title';
-    $('rSub').textContent = `Соперник ${name} завершил игру`;
-    $('rNext').textContent = `Итоговый счёт ${s.score.me} : ${s.score.opp}` +
-      (s.score.draw ? `, ничьих: ${s.score.draw}` : '');
+    $('rSub').textContent = `${name} выходит из игры`;
+    $('rNext').textContent = `Итог: ${place} место, ${pts} очк.`;
     $('toLobbyBtn').classList.remove('hidden');
     $('overlay').classList.remove('hidden');
   }
 
+  // при равенстве очков место общее
+  function placeOf(st, id) {
+    return 1 + st.players.filter((x) => st.pts[x] > st.pts[id]).length;
+  }
+
+  function rankOf(st) {
+    return [...st.players].sort((a, b) =>
+      (st.pts[b] - st.pts[a]) || (st.wins[b] - st.wins[a]) || (st.order[a] - st.order[b]));
+  }
+
+  // ---------- пьедестал ----------
+  const STEP_H = { 1: 44, 2: 30, 3: 20 };
+  const STEP_COL = { 1: 1, 2: 0, 3: 2 };
+
+  function placeStyle(el, place) {
+    el.style.left = `calc(${STEP_COL[place]} * ((100% - 12px) / 3 + 6px))`;
+    el.style.bottom = (STEP_H[place] + 4) + 'px';
+  }
+
+  function renderPodium(st, d) {
+    const pod = $('podium');
+    const rank = rankOf(st);
+    const ui = game.ui;
+    const prevRank = ui.members;
+    const atTable = new Set(d.pair || []);
+    const tokens = new Map([...pod.querySelectorAll('.ptoken')].map((el) => [el.dataset.id, el]));
+    rank.forEach((id, i) => {
+      let el = tokens.get(id);
+      tokens.delete(id);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'ptoken enter';
+        el.dataset.id = id;
+        el.innerHTML = '<div class="pav"><span class="pini"></span><span class="pbadge"></span></div><div class="pname"></div><div class="ppts"></div>';
+        placeStyle(el, i + 1);
+        pod.appendChild(el);
+      }
+      const prevPlace = prevRank ? prevRank.indexOf(id) : -1;
+      if (prevPlace >= 0 && prevPlace !== i) {
+        el.classList.remove('rise', 'fall');
+        void el.offsetWidth;
+        el.classList.add(i < prevPlace ? 'rise' : 'fall');
+      }
+      placeStyle(el, i + 1);
+      el.classList.toggle('me', id === me.id);
+      el.classList.toggle('atable', atTable.has(id));
+      const pav = el.querySelector('.pav');
+      pav.style.background = avatarBg(id);
+      el.querySelector('.pini').textContent = (nameOf(id)[0] || '?').toUpperCase();
+      el.querySelector('.pbadge').textContent = atTable.has(id) || st.players.length < 3 ? '' : '👀';
+      let crown = el.querySelector('.crown');
+      const lead = i === 0 && st.pts[id] > 0 && (rank.length < 2 || st.pts[id] > st.pts[rank[1]]);
+      if (lead && !crown) { crown = document.createElement('div'); crown.className = 'crown'; crown.textContent = '👑'; el.prepend(crown); }
+      if (!lead && crown) crown.remove();
+      el.querySelector('.pname').textContent = nameOf(id) + (id === me.id ? ' (ты)' : '');
+      const ptsEl = el.querySelector('.ppts');
+      const val = String(st.pts[id] || 0);
+      if (ptsEl.dataset.v !== undefined && ptsEl.dataset.v !== val) {
+        ptsEl.classList.remove('bump');
+        void ptsEl.offsetWidth;
+        ptsEl.classList.add('bump');
+      }
+      ptsEl.dataset.v = val;
+      ptsEl.innerHTML = `${val} <small>очк.</small>`;
+    });
+    // свободное место для третьего
+    if (rank.length < MAX_PLAYERS) {
+      let free = tokens.get('free');
+      tokens.delete('free');
+      if (!free) {
+        free = document.createElement('div');
+        free.className = 'ptoken free enter';
+        free.dataset.id = 'free';
+        free.innerHTML = '<div class="pav">+</div><div class="pname">ждём третьего игрока</div>';
+        pod.appendChild(free);
+      }
+      placeStyle(free, rank.length + 1);
+    }
+    for (const el of tokens.values()) {
+      el.style.opacity = '0';
+      setTimeout(() => el.remove(), 400);
+    }
+    ui.members = rank;
+  }
+
+  // ---------- доска ----------
   function buildBoard() {
     const board = $('board');
     board.innerHTML = '';
@@ -640,40 +932,39 @@
       c.addEventListener('click', () => onCellClick(i));
       board.appendChild(c);
     }
-    const wl = $('winLine');
-    wl.classList.remove('show', 'x', 'o');
+    $('winLine').classList.remove('show', 'x', 'o');
   }
 
-  function drawMark(i, who) {
+  function drawMark(i, mark) {
     const c = $('board').children[i];
     c.classList.remove('empty');
     c.classList.add('placed');
     c.style.animationDelay = '0s';
-    c.innerHTML = who === 'me'
+    c.innerHTML = mark === 'x'
       ? '<svg class="x drawn" viewBox="0 0 40 40"><path d="M10 10L30 30"/><path d="M30 10L10 30"/></svg>'
       : '<svg class="o drawn" viewBox="0 0 40 40"><circle cx="20" cy="20" r="12"/></svg>';
   }
 
-  function bump(id) {
-    const el = $(id);
-    el.classList.remove('bump');
-    void el.offsetWidth;
-    el.classList.add('bump');
+  // Каким значком рисовать игрока: у себя ты всегда ✕, соперник ◯.
+  // Наблюдатель видит ✕ у того, кто в этом раунде ходит первым.
+  function markOf(d, id) {
+    if (d.pair && d.pair.includes(me.id)) return id === me.id ? 'x' : 'o';
+    return id === d.first ? 'x' : 'o';
   }
 
-  // Перерисовка игры по истории ходов. live = изменение произошло только что
+  // Перерисовка игры по журналу. live = изменение произошло только что
   // (ход, синхронизация), а не при открытии сохранённой партии.
   function render(live) {
     if (!game || me.status !== 'playing') return;
     const ui = game.ui;
-    const s = replay(game.moves);
+    const st = replay(game.log);
 
-    if (s.over && ui.finished !== s.round) {
-      ui.finished = s.round;
-      if (live) roundFinished(s);
-      else ui.advanced = s.round;
+    if (st.over && st.round > 0 && !st.result?.aborted && ui.finished !== st.round) {
+      ui.finished = st.round;
+      if (live && ui.round === st.round) roundFinished(st);
+      else ui.advanced = st.round;
     }
-    const d = view(s);
+    const d = view(st);
 
     if (d.round !== ui.round) {
       clearTimeout(ui.nextTimer);
@@ -684,44 +975,115 @@
     }
     const cells = $('board').children;
     d.board.forEach((who, i) => {
-      if (who && cells[i].classList.contains('empty')) drawMark(i, who);
+      if (who && cells[i].classList.contains('empty')) drawMark(i, markOf(d, who));
     });
     if (d.over && ui.lineRound !== d.round) {
       ui.lineRound = d.round;
       $('board').classList.add('done');
       if (d.result.winner) {
-        for (const i of d.result.line) cells[i].classList.add('win', d.result.winner === 'me' ? 'wx' : 'wo');
-        drawWinLine(d.result.line, d.result.winner === 'me' ? 'x' : 'o');
+        const m = markOf(d, d.result.winner);
+        for (const i of d.result.line) cells[i].classList.add('win', m === 'x' ? 'wx' : 'wo');
+        drawWinLine(d.result.line, m);
       }
     }
 
-    // счёт
-    const sc = d.score;
-    if (ui.score) {
-      if (sc.me !== ui.score.me) bump('meScore');
-      if (sc.opp !== ui.score.opp) bump('oppScore');
-      if (sc.draw !== ui.score.draw) bump('drawScore');
-    }
-    ui.score = { ...sc };
-    $('meScore').textContent = sc.me;
-    $('oppScore').textContent = sc.opp;
-    $('drawScore').textContent = sc.draw;
-    $('roundInfo').textContent = 'Раунд ' + d.round;
-    updateTurn(d);
+    renderPodium(st, d);
+    renderMatch(st, d);
+    $('roundInfo').textContent = 'Раунд ' + Math.max(1, d.round);
+    const waiting = d.pair ? st.players.filter((id) => !d.pair.includes(id)) : [];
+    $('queueInfo').innerHTML = waiting.length
+      ? `Ждёт очереди: <b>${esc(waiting.map((id) => id === me.id ? 'ты' : nameOf(id)).join(', '))}</b>` : '';
+    $('endBtn').textContent = st.players.length > 2 ? 'Покинуть' : 'Завершить';
   }
 
-  function roundFinished(s) {
-    const ui = game.ui;
-    const r = s.round;
-    const winner = s.result.winner;
-    let icon, title, cls, sub;
-    if (winner === 'me') {
-      icon = '🏆'; title = 'Победа!'; cls = 'win'; sub = 'Победитель: <b></b>';
-      confetti();
-    } else if (winner === 'opp') {
-      icon = '😮'; title = 'Поражение'; cls = 'lose'; sub = 'Победитель: <b></b>';
+  function renderMatch(st, d) {
+    const sides = [$('mA'), $('mB')];
+    if (!d.pair) {
+      sides.forEach((s) => s.classList.add('hidden'));
+      $('turnInfo').textContent = 'Ждём игроков…';
+      return;
+    }
+    // слева — ты (если играешь) или тот, кто ходит первым
+    const left = d.pair.includes(me.id) ? me.id : d.first;
+    const ids = [left, other(d.pair, left)];
+    ids.forEach((id, i) => {
+      const s = sides[i];
+      const m = markOf(d, id);
+      s.classList.remove('hidden', 'x', 'o');
+      s.classList.add(m);
+      s.classList.toggle('active', !d.over && d.turn === id);
+      s.querySelector('.m-mark').innerHTML = m === 'x' ? X_SVG : O_SVG;
+      s.querySelector('.m-name').textContent = nameOf(id) + (id === me.id ? ' (ты)' : '');
+      const stEl = s.querySelector('.opp-state');
+      const ms = memberState(id);
+      stEl.className = 'opp-state ' + ms;
+      stEl.textContent = id === me.id ? (ms === 'ingame' ? 'в сети' : 'нет связи') : STATE_TEXT[ms];
+    });
+    updateTurn(st, d);
+  }
+
+  function updateTurn(st, d) {
+    const t = $('turnInfo');
+    const playing = d.pair && d.pair.includes(me.id);
+    const mine = playing && !d.over && d.turn === me.id;
+    const board = $('board');
+    board.classList.toggle('my-turn', !!mine);
+    board.classList.toggle('spectating', !!d.pair && !playing);
+    let eye = document.querySelector('.board-wrap .eye');
+    if (d.pair && !playing) {
+      if (!eye) {
+        eye = document.createElement('div');
+        eye.className = 'eye';
+        eye.textContent = '👀 ты наблюдаешь';
+        document.querySelector('.board-wrap').appendChild(eye);
+      }
+    } else if (eye) eye.remove();
+
+    t.innerHTML = '';
+    if (d.over) { t.className = 'turn'; return; }
+    if (!playing) {
+      t.className = 'turn watch';
+      t.append(`👀 Не твой ход · ходит ${nameOf(d.turn)}`);
+    } else if (mine) {
+      t.className = 'turn mine';
+      t.textContent = 'Твой ход!';
+      return;
     } else {
-      icon = '🤝'; title = 'Ничья!'; cls = ''; sub = 'Никто не уступил';
+      t.className = 'turn theirs';
+      const ms = memberState(d.turn);
+      t.append(ms === 'ingame' ? 'Ходит ' + nameOf(d.turn)
+        : ms === 'lobby' ? `${nameOf(d.turn)} в лобби — ждём возвращения`
+          : `${nameOf(d.turn)} не в сети — ждём возвращения`);
+    }
+    const dots = document.createElement('span');
+    dots.className = 'dots';
+    t.append(dots);
+  }
+
+  function roundFinished(st) {
+    const ui = game.ui;
+    const r = st.round;
+    const winner = st.result.winner;
+    const playing = st.pair.includes(me.id);
+    const nx = nextSetup(st);
+    let icon, title, cls, sub;
+    if (winner === me.id) {
+      icon = '🏆'; title = 'Победа!'; cls = 'win'; sub = `+${PTS_WIN} очка`;
+      confetti();
+    } else if (winner && playing) {
+      icon = '😮'; title = 'Поражение'; cls = 'lose'; sub = 'Победитель: <b></b>';
+    } else if (winner) {
+      icon = '🏆'; title = 'Раунд сыгран'; cls = ''; sub = 'Победитель: <b></b>';
+    } else {
+      icon = '🤝'; title = 'Ничья!'; cls = ''; sub = playing ? `+${PTS_DRAW} очко` : `${listNames(st.pair)}: по ${PTS_DRAW} очку`;
+    }
+    let next = '';
+    if (nx) {
+      const [a, b] = nx.pair;
+      if (!nx.pair.includes(me.id)) next = `Ты уступаешь место и пока наблюдаешь. Дальше играют: ${nameOf(a)} и ${nameOf(b)}`;
+      else if (!playing) next = `Твоя очередь! В следующем раунде твой соперник — ${nameOf(other(nx.pair, me.id))}`;
+      else if (st.players.length > 2) next = `Ты остаёшься за столом. Следующий соперник — ${nameOf(other(nx.pair, me.id))}`;
+      else next = `Следующий раунд — первым ходит ${nx.first === me.id ? 'ты' : nameOf(nx.first)}`;
     }
     const delay = winner ? 1300 : 500;
     ui.overlayTimer = setTimeout(() => {
@@ -733,10 +1095,9 @@
       const rs = $('rSub');
       rs.innerHTML = sub;
       const b = rs.querySelector('b');
-      if (b) b.textContent = winner === 'me' ? me.name : game.oppName;
+      if (b) b.textContent = nameOf(winner);
       $('toLobbyBtn').classList.add('hidden');
-      const nextFirst = moverOf(r + 1, 0) === 'me' ? 'ты' : game.oppName;
-      $('rNext').textContent = `Счёт ${s.score.me} : ${s.score.opp}. Следующий раунд — первым ходит ${nextFirst}`;
+      $('rNext').textContent = next;
       $('overlay').classList.remove('hidden');
     }, delay);
     ui.nextTimer = setTimeout(() => {
@@ -746,37 +1107,17 @@
     }, NEXT_ROUND_DELAY + delay);
   }
 
-  function updateTurn(d) {
-    const t = $('turnInfo');
-    const mine = d.turn === 'me' && !d.over;
-    $('board').classList.toggle('my-turn', mine);
-    $('pMe').classList.toggle('active', mine);
-    $('pOpp').classList.toggle('active', d.turn === 'opp' && !d.over);
-    if (d.over) { t.className = 'turn'; t.textContent = ''; return; }
-    if (mine) {
-      t.className = 'turn mine';
-      t.textContent = 'Твой ход!';
-      return;
-    }
-    t.className = 'turn theirs';
-    t.innerHTML = '';
-    const os = game.oppState;
-    t.append(os === 'ingame' ? 'Ходит ' + game.oppName
-      : os === 'lobby' ? `${game.oppName} в лобби — ждём возвращения`
-        : `${game.oppName} не в сети — ждём возвращения`);
-    const dots = document.createElement('span');
-    dots.className = 'dots';
-    t.append(dots);
-  }
-
   function onCellClick(i) {
     if (!game || me.status !== 'playing') return;
-    const d = view(replay(game.moves));
-    if (d.over || d.turn !== 'me' || d.board[i]) return;
-    game.moves += String(i);
-    saveGame();
+    flushPending();
+    if (!game) return;
+    const st = replay(game.log);
+    const d = view(st);
+    if (!d.pair || d.over || d.turn !== me.id || d.board[i]) return;
+    const before = st;
+    game.log = [...game.log, String(i)];
+    afterLogChange(before, true);
     sendState();
-    render(true);
   }
 
   function drawWinLine(line, cls) {
@@ -955,11 +1296,13 @@
   $('resumeBtn').addEventListener('click', () => openGame(false));
   $('resumeEndBtn').addEventListener('click', async () => {
     if (!game) return;
-    const ok = await ask(`Завершить игру? Соперник: <b>${esc(game.oppName)}</b>.<br>Продолжить её будет нельзя.`, 'Завершить');
-    if (ok && game) { endGameByMe(); renderLobby(); }
+    const three = replay(game.log).players.length > 2;
+    const ok = await ask(three ? 'Покинуть игру? Остальные продолжат без тебя.' : 'Завершить игру? Продолжить её будет нельзя.',
+      three ? 'Покинуть' : 'Завершить');
+    if (ok && game) { leaveGameByMe(); renderLobby(); }
   });
 
-  setInterval(() => { publishPresence(); refreshOpp(); renderLobby(); }, PRESENCE_EVERY);
+  setInterval(() => { publishPresence(); refreshMembers(); renderLobby(); }, PRESENCE_EVERY);
   addEventListener('pagehide', clearPresence);
 
   setupInstall();
